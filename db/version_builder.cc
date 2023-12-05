@@ -270,7 +270,7 @@ class VersionBuilder::Rep {
         base_vstorage_(base_vstorage),
         version_set_(version_set),
         num_levels_(base_vstorage->num_levels()),
-        levels_(std::make_unique<LevelState>(num_levels_)),
+        levels_(std::make_unique<LevelState[]>(num_levels_)),
         has_invalid_levels_(false),
         level_nonzero_cmp_(base_vstorage_->InternalComparator()),
         file_metadata_cache_res_mgr_(file_metadata_cache_res_mgr) {
