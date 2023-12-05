@@ -236,7 +236,7 @@ class VersionBuilder::Rep {
   VersionStorageInfo* base_vstorage_;
   VersionSet* version_set_;
   int num_levels_;
-  LevelState* levels_;
+  std::unique_ptr<LevelState[]> levels_;
   // Store sizes of levels larger than num_levels_. We do this instead of
   // storing them in levels_ to avoid regression in case there are no files
   // on invalid levels. The version is not consistent if in the end the files
@@ -270,7 +270,7 @@ class VersionBuilder::Rep {
         base_vstorage_(base_vstorage),
         version_set_(version_set),
         num_levels_(base_vstorage->num_levels()),
-        levels_(new LevelState[num_levels_]),
+        levels_(std::make_unique<LevelState>(num_levels_)),
         has_invalid_levels_(false),
         level_nonzero_cmp_(base_vstorage_->InternalComparator()),
         file_metadata_cache_res_mgr_(file_metadata_cache_res_mgr) {
@@ -284,8 +284,6 @@ class VersionBuilder::Rep {
         UnrefFile(pair.second);
       }
     }
-
-    delete[] levels_;
   }
 
   void UnrefFile(FileMetaData* f) {
