@@ -538,13 +538,14 @@ class NonBatchedOpsStressTest : public StressTest {
         thread->shared->Get(rand_column_families[0], rand_keys[0]);
 
     int injected_error_count = 0;
-    if (fault_fs_guard && !SharedState::ignore_read_error) {
+    if (fault_fs_guard) {
       injected_error_count = GetMinInjectedErrorCount(
           fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
               FaultInjectionIOType::kRead),
           fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
               FaultInjectionIOType::kMetadataRead));
-      if (injected_error_count > 0 && (s.ok() || s.IsNotFound())) {
+      if (!SharedState::ignore_read_error && injected_error_count > 0 &&
+          (s.ok() || s.IsNotFound())) {
         // Grab mutex so multiple thread don't try to print the
         // stack trace at the same time
         MutexLock l(thread->shared->GetMutex());
@@ -598,10 +599,7 @@ class NonBatchedOpsStressTest : public StressTest {
                   key.ToString(true).c_str());
         }
       }
-    } else if (injected_error_count > 0 && IsRetryableInjectedError(s)) {
-      fprintf(stdout, "error : Get() returns %s for key: %s.\n",
-              s.ToString().c_str(), key.ToString(true).c_str());
-    } else {
+    } else if (injected_error_count == 0 || !IsErrorInjectedAndRetryable(s)) {
       thread->shared->SetVerificationFailure();
       fprintf(stderr, "error : Get() returns %s for key: %s.\n",
               s.ToString().c_str(), key.ToString(true).c_str());
@@ -692,7 +690,7 @@ class NonBatchedOpsStressTest : public StressTest {
       }
       db_->MultiGet(readoptionscopy, cfh, num_keys, keys.data(), values.data(),
                     statuses.data());
-      if (fault_fs_guard && !SharedState::ignore_read_error) {
+      if (fault_fs_guard) {
         injected_error_count = GetMinInjectedErrorCount(
             fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
                 FaultInjectionIOType::kRead),
@@ -706,7 +704,8 @@ class NonBatchedOpsStressTest : public StressTest {
               stat_nok_nfound++;
             }
           }
-          if (stat_nok_nfound < injected_error_count) {
+          if (!SharedState::ignore_read_error &&
+              stat_nok_nfound < injected_error_count) {
             // Grab mutex so multiple thread don't try to print the
             // stack trace at the same time
             MutexLock l(shared->GetMutex());
@@ -874,15 +873,10 @@ class NonBatchedOpsStressTest : public StressTest {
       } else if (s.IsMergeInProgress() && use_txn) {
         // With txn this is sometimes expected.
         thread->stats.AddGets(1, 1);
-      } else {
-        if (injected_error_count > 0 && IsRetryableInjectedError(s)) {
-          fprintf(stdout, "MultiGet error: %s\n", s.ToString().c_str());
-          thread->stats.AddVerifiedErrors(1);
-        } else {
-          fprintf(stderr, "MultiGet error: %s\n", s.ToString().c_str());
-          thread->stats.AddErrors(1);
-          shared->SetVerificationFailure();
-        }
+      } else if (injected_error_count == 0 || !IsErrorInjectedAndRetryable(s)) {
+        fprintf(stderr, "MultiGet error: %s\n", s.ToString().c_str());
+        thread->stats.AddErrors(1);
+        shared->SetVerificationFailure();
       }
 
       // Enable back error injection disbled for checking results
@@ -1001,13 +995,14 @@ class NonBatchedOpsStressTest : public StressTest {
         thread->shared->Get(column_family, key);
 
     int injected_error_count = 0;
-    if (fault_fs_guard && !SharedState::ignore_read_error) {
+    if (fault_fs_guard) {
       injected_error_count = GetMinInjectedErrorCount(
           fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
               FaultInjectionIOType::kRead),
           fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
               FaultInjectionIOType::kMetadataRead));
-      if (injected_error_count > 0 && (s.ok() || s.IsNotFound())) {
+      if (!SharedState::ignore_read_error && injected_error_count > 0 &&
+          (s.ok() || s.IsNotFound())) {
         // Grab mutex so multiple thread don't try to print the
         // stack trace at the same time
         MutexLock l(thread->shared->GetMutex());
@@ -1077,10 +1072,7 @@ class NonBatchedOpsStressTest : public StressTest {
                   StringToHex(key_str).c_str());
         }
       }
-    } else if (injected_error_count > 0 && IsRetryableInjectedError(s)) {
-      fprintf(stdout, "error : GetEntity() returns %s for key: %s.\n",
-              s.ToString().c_str(), StringToHex(key_str).c_str());
-    } else {
+    } else if (injected_error_count == 0 || !IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "error : GetEntity() returns %s for key: %s.\n",
               s.ToString().c_str(), StringToHex(key_str).c_str());
       thread->shared->SetVerificationFailure();
@@ -1168,7 +1160,8 @@ class NonBatchedOpsStressTest : public StressTest {
           }
         }
 
-        if (stat_nok_nfound < injected_error_count) {
+        if (!SharedState::ignore_read_error &&
+            stat_nok_nfound < injected_error_count) {
           // Grab mutex so multiple threads don't try to print the
           // stack trace at the same time
           assert(thread->shared);
@@ -1275,15 +1268,11 @@ class NonBatchedOpsStressTest : public StressTest {
           thread->stats.AddGets(1, 1);
         } else if (s.IsNotFound()) {
           thread->stats.AddGets(1, 0);
-        } else {
-          if (injected_error_count > 0 && IsRetryableInjectedError(s)) {
-            fprintf(stderr, "MultiGetEntity error: %s\n", s.ToString().c_str());
-            thread->stats.AddVerifiedErrors(1);
-          } else {
-            fprintf(stderr, "MultiGetEntity error: %s\n", s.ToString().c_str());
-            thread->stats.AddErrors(1);
-            thread->shared->SetVerificationFailure();
-          }
+        } else if (injected_error_count == 0 ||
+                   !IsErrorInjectedAndRetryable(s)) {
+          fprintf(stderr, "MultiGetEntity error: %s\n", s.ToString().c_str());
+          thread->stats.AddErrors(1);
+          thread->shared->SetVerificationFailure();
         }
       }
       // Enable back error injection disbled for checking results
@@ -1401,7 +1390,7 @@ class NonBatchedOpsStressTest : public StressTest {
       db_->MultiGetEntity(read_opts_copy, num_keys, key_slices.data(),
                           results.data());
 
-      if (fault_fs_guard && !SharedState::ignore_read_error) {
+      if (fault_fs_guard) {
         verify_expected_errors(
             [&](size_t i) { return results[i][0].status(); });
       }
@@ -1431,7 +1420,7 @@ class NonBatchedOpsStressTest : public StressTest {
       db_->MultiGetEntity(read_opts_copy, cfh, num_keys, key_slices.data(),
                           results.data(), statuses.data());
 
-      if (fault_fs_guard && !SharedState::ignore_read_error) {
+      if (fault_fs_guard) {
         verify_expected_errors([&](size_t i) { return statuses[i]; });
       }
 
@@ -1478,11 +1467,6 @@ class NonBatchedOpsStressTest : public StressTest {
     MaybeUseOlderTimestampForRangeScan(thread, read_ts_str, read_ts_slice,
                                        ro_copy);
 
-    std::unique_ptr<Iterator> iter(db_->NewIterator(ro_copy, cfh));
-
-    uint64_t count = 0;
-    Status s;
-
     if (fault_fs_guard) {
       fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
           FaultInjectionIOType::kRead);
@@ -1490,6 +1474,11 @@ class NonBatchedOpsStressTest : public StressTest {
           FaultInjectionIOType::kMetadataRead);
       SharedState::ignore_read_error = false;
     }
+
+    std::unique_ptr<Iterator> iter(db_->NewIterator(ro_copy, cfh));
+
+    uint64_t count = 0;
+    Status s;
 
     for (iter->Seek(prefix); iter->Valid() && iter->key().starts_with(prefix);
          iter->Next()) {
@@ -1522,13 +1511,14 @@ class NonBatchedOpsStressTest : public StressTest {
     }
 
     int injected_error_count = 0;
-    if (fault_fs_guard && !SharedState::ignore_read_error) {
+    if (fault_fs_guard) {
       injected_error_count = GetMinInjectedErrorCount(
           fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
               FaultInjectionIOType::kRead),
           fault_fs_guard->GetAndResetInjectedThreadLocalErrorCount(
               FaultInjectionIOType::kMetadataRead));
-      if (injected_error_count > 0 && s.ok()) {
+      if (!SharedState::ignore_read_error && injected_error_count > 0 &&
+          s.ok()) {
         // Grab mutex so multiple thread don't try to print the
         // stack trace at the same time
         MutexLock l(thread->shared->GetMutex());
@@ -1544,9 +1534,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
     if (s.ok()) {
       thread->stats.AddPrefixes(1, count);
-    } else if (injected_error_count > 0 && IsRetryableInjectedError(s)) {
-      fprintf(stdout, "TestPrefixScan error: %s\n", s.ToString().c_str());
-    } else {
+    } else if (injected_error_count == 0 || !IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "TestPrefixScan error: %s\n", s.ToString().c_str());
       thread->shared->SetVerificationFailure();
     }
@@ -1598,14 +1586,13 @@ class NonBatchedOpsStressTest : public StressTest {
 
     if (FLAGS_verify_before_write) {
       // Temporarily disable error injection for preparation
-      fault_fs_guard->DisableThreadLocalErrorInjection(
-          FaultInjectionIOType::kRead);
-      fault_fs_guard->DisableThreadLocalErrorInjection(
-          FaultInjectionIOType::kWrite);
-      fault_fs_guard->DisableThreadLocalErrorInjection(
-          FaultInjectionIOType::kMetadataRead);
-      fault_fs_guard->DisableThreadLocalErrorInjection(
-          FaultInjectionIOType::kMetadataWrite);
+      if (fault_fs_guard) {
+        fault_fs_guard->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kRead);
+        fault_fs_guard->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
+
       std::string from_db;
       Status s = db_->Get(read_opts, cfh, k, &from_db);
       bool res = VerifyOrSyncValue(
@@ -1613,14 +1600,12 @@ class NonBatchedOpsStressTest : public StressTest {
           /* msg_prefix */ "Pre-Put Get verification", from_db, s);
 
       // Enable back error injection disabled for preparation
-      fault_fs_guard->EnableThreadLocalErrorInjection(
-          FaultInjectionIOType::kRead);
-      fault_fs_guard->EnableThreadLocalErrorInjection(
-          FaultInjectionIOType::kWrite);
-      fault_fs_guard->EnableThreadLocalErrorInjection(
-          FaultInjectionIOType::kMetadataRead);
-      fault_fs_guard->EnableThreadLocalErrorInjection(
-          FaultInjectionIOType::kMetadataWrite);
+      if (fault_fs_guard) {
+        fault_fs_guard->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kRead);
+        fault_fs_guard->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
       if (!res) {
         return s;
       }
@@ -1686,8 +1671,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
     if (!s.ok()) {
       pending_expected_value.Rollback();
-      if (IsRetryableInjectedError(s)) {
-        fprintf(stdout, "put or merge error: %s\n", s.ToString().c_str());
+      if (IsErrorInjectedAndRetryable(s)) {
         return s;
       } else if (FLAGS_inject_error_severity == 2) {
         if (!is_db_stopped_ && s.severity() >= Status::Severity::kFatalError) {
@@ -1747,8 +1731,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
       if (!s.ok()) {
         pending_expected_value.Rollback();
-        if (IsRetryableInjectedError(s)) {
-          fprintf(stdout, "delete error: %s\n", s.ToString().c_str());
+        if (IsErrorInjectedAndRetryable(s)) {
           return s;
         } else if (FLAGS_inject_error_severity == 2) {
           if (!is_db_stopped_ &&
@@ -1783,8 +1766,7 @@ class NonBatchedOpsStressTest : public StressTest {
 
       if (!s.ok()) {
         pending_expected_value.Rollback();
-        if (IsRetryableInjectedError(s)) {
-          fprintf(stdout, "delete error: %s\n", s.ToString().c_str());
+        if (IsErrorInjectedAndRetryable(s)) {
           return s;
         } else if (FLAGS_inject_error_severity == 2) {
           if (!is_db_stopped_ &&
@@ -1854,8 +1836,7 @@ class NonBatchedOpsStressTest : public StressTest {
            pending_expected_values) {
         pending_expected_value.Rollback();
       }
-      if (IsRetryableInjectedError(s)) {
-        fprintf(stdout, "delete range error: %s\n", s.ToString().c_str());
+      if (IsErrorInjectedAndRetryable(s)) {
         return s;
       } else if (FLAGS_inject_error_severity == 2) {
         if (!is_db_stopped_ && s.severity() >= Status::Severity::kFatalError) {
@@ -1888,19 +1869,24 @@ class NonBatchedOpsStressTest : public StressTest {
     std::ostringstream ingest_options_oss;
 
     // Temporarily disable error injection for preparation
-    fault_fs_guard->DisableThreadLocalErrorInjection(
-        FaultInjectionIOType::kMetadataRead);
-    fault_fs_guard->DisableThreadLocalErrorInjection(
-        FaultInjectionIOType::kMetadataWrite);
+    if (fault_fs_guard) {
+      fault_fs_guard->DisableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataRead);
+      fault_fs_guard->DisableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
+
     if (db_stress_env->FileExists(sst_filename).ok()) {
       // Maybe we terminated abnormally before, so cleanup to give this file
       // ingestion a clean slate
       s = db_stress_env->DeleteFile(sst_filename);
     }
-    fault_fs_guard->EnableThreadLocalErrorInjection(
-        FaultInjectionIOType::kMetadataRead);
-    fault_fs_guard->EnableThreadLocalErrorInjection(
-        FaultInjectionIOType::kMetadataWrite);
+    if (fault_fs_guard) {
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataRead);
+      fault_fs_guard->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
 
     SstFileWriter sst_file_writer(EnvOptions(options_), options_);
     if (s.ok()) {
@@ -1983,9 +1969,7 @@ class NonBatchedOpsStressTest : public StressTest {
         pending_expected_value.Rollback();
       }
 
-      if (IsRetryableInjectedError(s)) {
-        fprintf(stdout, "file ingestion error: %s \n", s.ToString().c_str());
-      } else {
+      if (!IsErrorInjectedAndRetryable(s)) {
         fprintf(stderr,
                 "file ingestion error: %s under specified "
                 "IngestExternalFileOptions: %s (Empty string or "
@@ -2174,11 +2158,7 @@ class NonBatchedOpsStressTest : public StressTest {
       assert(last_key < ub);
       if (!iter->Valid()) {
         if (!iter->status().ok()) {
-          if (IsRetryableInjectedError(iter->status())) {
-            fprintf(
-                stdout,
-                "TestIterate against expected state forward scan error: %s\n",
-                iter->status().ToString().c_str());
+          if (IsErrorInjectedAndRetryable(iter->status())) {
             return iter->status();
           } else {
             thread->shared->SetVerificationFailure();
@@ -2240,11 +2220,7 @@ class NonBatchedOpsStressTest : public StressTest {
       assert(lb < last_key);
       if (!iter->Valid()) {
         if (!iter->status().ok()) {
-          if (IsRetryableInjectedError(iter->status())) {
-            fprintf(
-                stdout,
-                "TestIterate against expected state backward scan error: %s\n",
-                iter->status().ToString().c_str());
+          if (IsErrorInjectedAndRetryable(iter->status())) {
             return iter->status();
           } else {
             thread->shared->SetVerificationFailure();
@@ -2308,10 +2284,7 @@ class NonBatchedOpsStressTest : public StressTest {
             shared->Get(rand_column_family, i + lb));
       }
       Status rs = iter->Refresh();
-      if (!rs.ok() && IsRetryableInjectedError(rs)) {
-        fprintf(stdout,
-                "TestIterate against expected state refresh error: %s\n",
-                iter->status().ToString().c_str());
+      if (!rs.ok() && IsErrorInjectedAndRetryable(rs)) {
         return rs;
       }
       assert(rs.ok());
@@ -2475,11 +2448,7 @@ class NonBatchedOpsStressTest : public StressTest {
     }
 
     if (!iter->status().ok()) {
-      if (IsRetryableInjectedError(iter->status())) {
-        fprintf(
-            stdout,
-            "TestIterate against expected state scan from middle error: %s\n",
-            iter->status().ToString().c_str());
+      if (IsErrorInjectedAndRetryable(iter->status())) {
         return iter->status();
       } else {
         thread->shared->SetVerificationFailure();
