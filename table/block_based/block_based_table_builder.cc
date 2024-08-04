@@ -293,9 +293,10 @@ struct BlockBasedTableBuilder::Rep {
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
+  std::string index_separator_scratch;
   PartitionedIndexBuilder* p_index_builder_ = nullptr;
 
-  std::string last_key;
+  std::string last_ikey;  // Internal key or empty (unset)
   const Slice* first_key_in_next_block = nullptr;
   CompressionType compression_type;
   uint64_t sample_for_compression;
@@ -997,24 +998,24 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
   delete rep_;
 }
 
-void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
+void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
   Rep* r = rep_;
   assert(rep_->state != Rep::State::kClosed);
   if (!ok()) {
     return;
   }
-  ValueType value_type = ExtractValueType(key);
+  ValueType value_type = ExtractValueType(ikey);
   if (IsValueType(value_type)) {
 #ifndef NDEBUG
     if (r->props.num_entries > r->props.num_range_deletions) {
-      assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
+      assert(r->internal_comparator.Compare(ikey, Slice(r->last_ikey)) > 0);
     }
 #endif  // !NDEBUG
 
-    auto should_flush = r->flush_block_policy->Update(key, value);
+    auto should_flush = r->flush_block_policy->Update(ikey, value);
     if (should_flush) {
       assert(!r->data_block.empty());
-      r->first_key_in_next_block = &key;
+      r->first_key_in_next_block = &ikey;
       Flush();
       if (r->state == Rep::State::kBuffered) {
         bool exceeds_buffer_limit =
@@ -1049,8 +1050,9 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
         if (r->IsParallelCompressionEnabled()) {
           r->pc_rep->curr_block_keys->Clear();
         } else {
-          r->index_builder->AddIndexEntry(&r->last_key, &key,
-                                          r->pending_handle);
+          r->index_builder->AddIndexEntry(r->last_ikey, &ikey,
+                                          r->pending_handle,
+                                          &r->index_separator_scratch);
         }
       }
     }
@@ -1059,27 +1061,28 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
     // builder after being added to index builder.
     if (r->state == Rep::State::kUnbuffered) {
       if (r->IsParallelCompressionEnabled()) {
-        r->pc_rep->curr_block_keys->PushBack(key);
+        r->pc_rep->curr_block_keys->PushBack(ikey);
       } else {
         if (r->filter_builder != nullptr) {
           r->filter_builder->Add(
-              ExtractUserKeyAndStripTimestamp(key, r->ts_sz));
+              ExtractUserKeyAndStripTimestamp(ikey, r->ts_sz));
         }
       }
     }
 
-    r->data_block.AddWithLastKey(key, value, r->last_key);
-    r->last_key.assign(key.data(), key.size());
+    r->data_block.AddWithLastKey(ikey, value, r->last_ikey);
+    r->last_ikey.assign(ikey.data(), ikey.size());
+    assert(!r->last_ikey.empty());
     if (r->state == Rep::State::kBuffered) {
       // Buffered keys will be replayed from data_block_buffers during
       // `Finish()` once compression dictionary has been finalized.
     } else {
       if (!r->IsParallelCompressionEnabled()) {
-        r->index_builder->OnKeyAdded(key);
+        r->index_builder->OnKeyAdded(ikey);
       }
     }
     // TODO offset passed in is not accurate for parallel compression case
-    NotifyCollectTableCollectorsOnAdd(key, value, r->get_offset(),
+    NotifyCollectTableCollectorsOnAdd(ikey, value, r->get_offset(),
                                       r->table_properties_collectors,
                                       r->ioptions.logger);
 
@@ -1093,9 +1096,9 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
     if (r->ts_sz > 0 && !r->persist_user_defined_timestamps) {
       persisted_end = StripTimestampFromUserKey(value, r->ts_sz);
     }
-    r->range_del_block.Add(key, persisted_end);
+    r->range_del_block.Add(ikey, persisted_end);
     // TODO offset passed in is not accurate for parallel compression case
-    NotifyCollectTableCollectorsOnAdd(key, value, r->get_offset(),
+    NotifyCollectTableCollectorsOnAdd(ikey, value, r->get_offset(),
                                       r->table_properties_collectors,
                                       r->ioptions.logger);
   } else {
@@ -1107,7 +1110,7 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
   }
 
   r->props.num_entries++;
-  r->props.raw_key_size += key.size();
+  r->props.raw_key_size += ikey.size();
   if (!r->persist_user_defined_timestamps) {
     r->props.raw_key_size -= r->ts_sz;
   }
@@ -1485,14 +1488,15 @@ void BlockBasedTableBuilder::BGWorkWriteMaybeCompressedBlock() {
     ++r->props.num_data_blocks;
 
     if (block_rep->first_key_in_next_block == nullptr) {
-      r->index_builder->AddIndexEntry(&(block_rep->keys->Back()), nullptr,
-                                      r->pending_handle);
+      r->index_builder->AddIndexEntry(block_rep->keys->Back(), nullptr,
+                                      r->pending_handle,
+                                      &r->index_separator_scratch);
     } else {
       Slice first_key_in_next_block =
           Slice(*block_rep->first_key_in_next_block);
-      r->index_builder->AddIndexEntry(&(block_rep->keys->Back()),
-                                      &first_key_in_next_block,
-                                      r->pending_handle);
+      r->index_builder->AddIndexEntry(
+          block_rep->keys->Back(), &first_key_in_next_block, r->pending_handle,
+          &r->index_separator_scratch);
     }
 
     r->pc_rep->ReapBlock(block_rep);
@@ -1576,9 +1580,10 @@ void BlockBasedTableBuilder::WriteFilterBlock(
       // See FilterBlockBuilder::Finish() for more on the difference in
       // transferred filter data payload among different FilterBlockBuilder
       // subtypes.
-      std::unique_ptr<const char[]> filter_data;
-      Slice filter_content =
-          rep_->filter_builder->Finish(filter_block_handle, &s, &filter_data);
+      std::unique_ptr<const char[]> filter_owner;
+      Slice filter_content;
+      s = rep_->filter_builder->Finish(filter_block_handle, &filter_content,
+                                       &filter_owner);
 
       assert(s.ok() || s.IsIncomplete() || s.IsCorruption());
       if (s.IsCorruption()) {
@@ -1987,9 +1992,9 @@ void BlockBasedTableBuilder::EnterUnbuffered() {
         Slice* first_key_in_next_block_ptr = &first_key_in_next_block;
 
         iter->SeekToLast();
-        std::string last_key = iter->key().ToString();
-        r->index_builder->AddIndexEntry(&last_key, first_key_in_next_block_ptr,
-                                        r->pending_handle);
+        r->index_builder->AddIndexEntry(
+            iter->key(), first_key_in_next_block_ptr, r->pending_handle,
+            &r->index_separator_scratch);
       }
     }
     std::swap(iter, next_block_iter);
@@ -2025,7 +2030,8 @@ Status BlockBasedTableBuilder::Finish() {
     // block, we will finish writing all index entries first.
     if (ok() && !empty_data_block) {
       r->index_builder->AddIndexEntry(
-          &r->last_key, nullptr /* no next data block */, r->pending_handle);
+          r->last_ikey, nullptr /* no next data block */, r->pending_handle,
+          &r->index_separator_scratch);
     }
   }
 
