@@ -75,6 +75,7 @@ default_params = {
     "compaction_pri": random.randint(0, 4),
     "key_may_exist_one_in": lambda: random.choice([100, 100000]),
     "data_block_index_type": lambda: random.choice([0, 1]),
+    "decouple_partitioned_filters": lambda: random.choice([0, 1, 1]),
     "delpercent": 4,
     "delrangepercent": 1,
     "destroy_db_initially": 0,
@@ -130,7 +131,8 @@ default_params = {
     "prefixpercent": 5,
     "progress_reports": 0,
     "readpercent": 45,
-    "recycle_log_file_num": lambda: random.randint(0, 1),
+    # See disabled DBWALTest.RecycleMultipleWalsCrash
+    "recycle_log_file_num": 0,
     "snapshot_hold_ops": 100000,
     "sqfc_name": lambda: random.choice(["foo", "bar"]),
     # 0 = disable writing SstQueryFilters
