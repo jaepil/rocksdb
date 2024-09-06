@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <set>
+#include <algorithm>
 
 #include "file/filename.h"
 #include "port/port.h"
