@@ -1050,6 +1050,11 @@ class LevelIterator final : public InternalIterator {
     return file_iter_.value();
   }
 
+  uint64_t write_unix_time() const override {
+    assert(Valid());
+    return file_iter_.write_unix_time();
+  }
+
   Status status() const override {
     return file_iter_.iter() ? file_iter_.status() : Status::OK();
   }
@@ -1968,9 +1973,16 @@ uint64_t VersionStorageInfo::GetEstimatedActiveKeys() const {
   }
 
   if (current_num_samples_ < file_count) {
-    // casting to avoid overflowing
-    return static_cast<uint64_t>(
-        (est * static_cast<double>(file_count) / current_num_samples_));
+    assert(current_num_samples_ != 0);
+    assert(est != 0);
+    double multiplier = static_cast<double>(file_count) / current_num_samples_;
+    double maximum_multiplier =
+        static_cast<double>(std::numeric_limits<uint64_t>::max()) / est;
+    // If it can overflow, we return the maximum unsigned long.
+    if (multiplier >= maximum_multiplier) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    return static_cast<uint64_t>(est * multiplier);
   } else {
     return est;
   }

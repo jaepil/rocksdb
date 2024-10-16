@@ -339,6 +339,16 @@ bool StressTest::BuildOptionsTable() {
            "2",
        }},
       {"max_sequential_skip_in_iterations", {"4", "8", "12"}},
+      // XXX: BlockBasedTableOptions fields are mutable, but there is a
+      // read-write race condition affecting them with SetOptions.
+      // See https://github.com/facebook/rocksdb/issues/10079
+      // {"block_based_table_factory", {"{block_size=2048}",
+      //                                "{block_size=4096}"}},
+      // Also TODO: a way here to modify many different BBTO fields
+      // {"block_based_table_factory", {"{filter_policy=bloomfilter:2.34",
+      //                                "{filter_policy=ribbonfilter:3.45",
+      //                                "{filter_policy=ribbonfilter:4.56:-1",
+      //                                "{filter_policy=ribbonfilter:6.67:3"}},
   };
   if (FLAGS_compaction_style == kCompactionStyleUniversal &&
       FLAGS_universal_max_read_amp > 0) {
@@ -2427,22 +2437,31 @@ Status StressTest::TestApproximateSize(
   std::string key1_str = Key(key1);
   std::string key2_str = Key(key2);
   Range range{Slice(key1_str), Slice(key2_str)};
-  SizeApproximationOptions sao;
-  sao.include_memtables = thread->rand.OneIn(2);
-  if (sao.include_memtables) {
-    sao.include_files = thread->rand.OneIn(2);
-  }
-  if (thread->rand.OneIn(2)) {
-    if (thread->rand.OneIn(2)) {
-      sao.files_size_error_margin = 0.0;
-    } else {
-      sao.files_size_error_margin =
-          static_cast<double>(thread->rand.Uniform(3));
+  if (thread->rand.OneIn(3)) {
+    // Call GetApproximateMemTableStats instead
+    uint64_t count, size;
+    db_->GetApproximateMemTableStats(column_families_[rand_column_families[0]],
+                                     range, &count, &size);
+    return Status::OK();
+  } else {
+    // Call GetApproximateSizes
+    SizeApproximationOptions sao;
+    sao.include_memtables = thread->rand.OneIn(2);
+    if (sao.include_memtables) {
+      sao.include_files = thread->rand.OneIn(2);
     }
+    if (thread->rand.OneIn(2)) {
+      if (thread->rand.OneIn(2)) {
+        sao.files_size_error_margin = 0.0;
+      } else {
+        sao.files_size_error_margin =
+            static_cast<double>(thread->rand.Uniform(3));
+      }
+    }
+    uint64_t result;
+    return db_->GetApproximateSizes(
+        sao, column_families_[rand_column_families[0]], &range, 1, &result);
   }
-  uint64_t result;
-  return db_->GetApproximateSizes(
-      sao, column_families_[rand_column_families[0]], &range, 1, &result);
 }
 
 Status StressTest::TestCheckpoint(ThreadState* thread,
