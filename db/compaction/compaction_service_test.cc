@@ -3,9 +3,9 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
+#include "rocksdb/utilities/options_util.h"
 #include "table/unique_id_impl.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -349,7 +349,27 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   } else {
     ASSERT_OK(result.status);
   }
+  ASSERT_GE(result.stats.elapsed_micros, 1);
+  ASSERT_GE(result.stats.cpu_micros, 1);
+
+  ASSERT_EQ(20, result.stats.num_output_records);
+  ASSERT_EQ(result.output_files.size(), result.stats.num_output_files);
+
+  uint64_t total_size = 0;
+  for (auto output_file : result.output_files) {
+    std::string file_name = result.output_path + "/" + output_file.file_name;
+
+    uint64_t file_size = 0;
+    ASSERT_OK(options.env->GetFileSize(file_name, &file_size));
+    ASSERT_GT(file_size, 0);
+    total_size += file_size;
+  }
+  ASSERT_EQ(total_size, result.stats.total_output_bytes);
+
   ASSERT_TRUE(result.stats.is_remote_compaction);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_FALSE(result.stats.is_full_compaction);
+
   Close();
 }
 
@@ -394,6 +414,258 @@ TEST_F(CompactionServiceTest, ManualCompaction) {
   ASSERT_OK(result.status);
   ASSERT_TRUE(result.stats.is_manual_compaction);
   ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+TEST_F(CompactionServiceTest, PreservedOptionsLocalCompaction) {
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 2;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  for (auto i = 0; i < 2; ++i) {
+    for (auto j = 0; j < 10; ++j) {
+      ASSERT_OK(
+          Put("foo" + std::to_string(i * 10 + j), rnd.RandomString(1024)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::Processing", [&](void* arg) {
+        auto compaction = static_cast<Compaction*>(arg);
+        std::string options_file_name = OptionsFileName(
+            dbname_,
+            compaction->input_version()->version_set()->options_file_number());
+
+        // Change option twice to make sure the very first OPTIONS file gets
+        // purged
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "4"}}));
+        ASSERT_EQ(4, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "6"}}));
+        ASSERT_EQ(6, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        dbfull()->TEST_DeleteObsoleteFiles();
+
+        // For non-remote compactions, OPTIONS file can be deleted while
+        // using option at the start of the compaction
+        Status s = env_->FileExists(options_file_name);
+        ASSERT_NOK(s);
+        ASSERT_TRUE(s.IsNotFound());
+        // Should be old value
+        ASSERT_EQ(2, compaction->mutable_cf_options()
+                         ->level0_file_num_compaction_trigger);
+        ASSERT_TRUE(dbfull()->min_options_file_numbers_.empty());
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  Status s = dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(s.ok());
+}
+
+TEST_F(CompactionServiceTest, PreservedOptionsRemoteCompaction) {
+  // For non-remote compaction do not preserve options file
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 2;
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  Random rnd(301);
+  for (auto i = 0; i < 2; ++i) {
+    for (auto j = 0; j < 10; ++j) {
+      ASSERT_OK(
+          Put("foo" + std::to_string(i * 10 + j), rnd.RandomString(1024)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  bool is_primary_called = false;
+  // This will be called twice. One from primary and one from remote.
+  // Try changing the option when called from remote. Otherwise, the new option
+  // will be used
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:NonTrivial:BeforeRun", [&](void* /*arg*/) {
+        if (!is_primary_called) {
+          is_primary_called = true;
+          return;
+        }
+        // Change the option right before the compaction run
+        ASSERT_OK(dbfull()->SetOptions(
+            {{"level0_file_num_compaction_trigger", "4"}}));
+        ASSERT_EQ(4, dbfull()->GetOptions().level0_file_num_compaction_trigger);
+        dbfull()->TEST_DeleteObsoleteFiles();
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionServiceJob::ProcessKeyValueCompactionWithCompactionService",
+      [&](void* arg) {
+        auto input = static_cast<CompactionServiceInput*>(arg);
+        std::string options_file_name =
+            OptionsFileName(dbname_, input->options_file_number);
+
+        ASSERT_OK(env_->FileExists(options_file_name));
+        ASSERT_FALSE(dbfull()->min_options_file_numbers_.empty());
+        ASSERT_EQ(dbfull()->min_options_file_numbers_.front(),
+                  input->options_file_number);
+
+        DBOptions db_options;
+        ConfigOptions config_options;
+        std::vector<ColumnFamilyDescriptor> all_column_families;
+        config_options.env = env_;
+        ASSERT_OK(LoadOptionsFromFile(config_options, options_file_name,
+                                      &db_options, &all_column_families));
+        bool has_cf = false;
+        for (auto& cf : all_column_families) {
+          if (cf.name == input->cf_name) {
+            // Should be old value
+            ASSERT_EQ(2, cf.options.level0_file_num_compaction_trigger);
+            has_cf = true;
+          }
+        }
+        ASSERT_TRUE(has_cf);
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::Processing", [&](void* arg) {
+        auto compaction = static_cast<Compaction*>(arg);
+        ASSERT_EQ(2, compaction->mutable_cf_options()
+                         ->level0_file_num_compaction_trigger);
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  Status s = dbfull()->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+  ASSERT_TRUE(s.ok());
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+class EventVerifier : public EventListener {
+ public:
+  explicit EventVerifier(uint64_t expected_num_input_records,
+                         size_t expected_num_input_files,
+                         uint64_t expected_num_output_records,
+                         size_t expected_num_output_files,
+                         const std::string& expected_smallest_output_key_prefix,
+                         const std::string& expected_largest_output_key_prefix,
+                         bool expected_is_remote_compaction_on_begin,
+                         bool expected_is_remote_compaction_on_complete)
+      : expected_num_input_records_(expected_num_input_records),
+        expected_num_input_files_(expected_num_input_files),
+        expected_num_output_records_(expected_num_output_records),
+        expected_num_output_files_(expected_num_output_files),
+        expected_smallest_output_key_prefix_(
+            expected_smallest_output_key_prefix),
+        expected_largest_output_key_prefix_(expected_largest_output_key_prefix),
+        expected_is_remote_compaction_on_begin_(
+            expected_is_remote_compaction_on_begin),
+        expected_is_remote_compaction_on_complete_(
+            expected_is_remote_compaction_on_complete) {}
+  void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+    ASSERT_EQ(expected_num_input_files_, ci.input_files.size());
+    ASSERT_EQ(expected_num_input_files_, ci.input_file_infos.size());
+    ASSERT_EQ(expected_is_remote_compaction_on_begin_,
+              ci.stats.is_remote_compaction);
+    ASSERT_TRUE(ci.stats.is_manual_compaction);
+    ASSERT_FALSE(ci.stats.is_full_compaction);
+  }
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    ASSERT_GT(ci.stats.elapsed_micros, 0);
+    ASSERT_GT(ci.stats.cpu_micros, 0);
+    ASSERT_EQ(expected_num_input_records_, ci.stats.num_input_records);
+    ASSERT_EQ(expected_num_input_files_, ci.stats.num_input_files);
+    ASSERT_EQ(expected_num_output_records_, ci.stats.num_output_records);
+    ASSERT_EQ(expected_num_output_files_, ci.stats.num_output_files);
+    ASSERT_EQ(expected_smallest_output_key_prefix_,
+              ci.stats.smallest_output_key_prefix);
+    ASSERT_EQ(expected_largest_output_key_prefix_,
+              ci.stats.largest_output_key_prefix);
+    ASSERT_GT(ci.stats.total_input_bytes, 0);
+    ASSERT_GT(ci.stats.total_output_bytes, 0);
+    ASSERT_EQ(ci.stats.num_input_records,
+              ci.stats.num_output_records + ci.stats.num_records_replaced);
+    ASSERT_EQ(expected_is_remote_compaction_on_complete_,
+              ci.stats.is_remote_compaction);
+    ASSERT_TRUE(ci.stats.is_manual_compaction);
+    ASSERT_FALSE(ci.stats.is_full_compaction);
+  }
+
+ private:
+  uint64_t expected_num_input_records_;
+  size_t expected_num_input_files_;
+  uint64_t expected_num_output_records_;
+  size_t expected_num_output_files_;
+  std::string expected_smallest_output_key_prefix_;
+  std::string expected_largest_output_key_prefix_;
+  bool expected_is_remote_compaction_on_begin_;
+  bool expected_is_remote_compaction_on_complete_;
+};
+
+TEST_F(CompactionServiceTest, VerifyStats) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  auto event_verifier = std::make_shared<EventVerifier>(
+      30 /* expected_num_input_records */, 3 /* expected_num_input_files */,
+      20 /* expected_num_output_records */, 1 /* expected_num_output_files */,
+      "key00000" /* expected_smallest_output_key_prefix */,
+      "key00001" /* expected_largest_output_key_prefix */,
+      true /* expected_is_remote_compaction_on_begin */,
+      true /* expected_is_remote_compaction_on_complete */);
+  options.listeners.push_back(event_verifier);
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(0);
+  std::string end_str = Key(1);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+  VerifyTestData();
+
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_TRUE(result.stats.is_manual_compaction);
+  ASSERT_TRUE(result.stats.is_remote_compaction);
+}
+
+TEST_F(CompactionServiceTest, VerifyStatsLocalFallback) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  auto event_verifier = std::make_shared<EventVerifier>(
+      30 /* expected_num_input_records */, 3 /* expected_num_input_files */,
+      20 /* expected_num_output_records */, 1 /* expected_num_output_files */,
+      "key00000" /* expected_smallest_output_key_prefix */,
+      "key00001" /* expected_largest_output_key_prefix */,
+      true /* expected_is_remote_compaction_on_begin */,
+      false /* expected_is_remote_compaction_on_complete */);
+  options.listeners.push_back(event_verifier);
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+  my_cs->OverrideStartStatus(CompactionServiceJobStatus::kUseLocal);
+
+  std::string start_str = Key(0);
+  std::string end_str = Key(1);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), &start, &end));
+  // Remote Compaction did not happen
+  ASSERT_EQ(my_cs->GetCompactionNum(), comp_num);
+  VerifyTestData();
 }
 
 TEST_F(CompactionServiceTest, CorruptedOutput) {

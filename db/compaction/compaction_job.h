@@ -209,6 +209,8 @@ class CompactionJob {
   // Returns true iff compaction_stats_.stats.num_input_records and
   // num_input_range_del are calculated successfully.
   bool UpdateCompactionStats(uint64_t* num_input_range_del = nullptr);
+  virtual void UpdateCompactionJobStats(
+      const InternalStats::CompactionStats& stats) const;
   void LogCompaction();
   virtual void RecordCompactionIOStats();
   void CleanupCompaction();
@@ -279,8 +281,7 @@ class CompactionJob {
                                   bool* compaction_released);
   Status OpenCompactionOutputFile(SubcompactionState* sub_compact,
                                   CompactionOutputs& outputs);
-  void UpdateCompactionJobStats(
-      const InternalStats::CompactionStats& stats) const;
+
   void RecordDroppedKeys(const CompactionIterationStats& c_iter_stats,
                          CompactionJobStats* compaction_job_stats = nullptr);
 
@@ -385,7 +386,7 @@ struct CompactionServiceInput {
   // files needed for this compaction, for both input level files and output
   // level files.
   std::vector<std::string> input_files;
-  int output_level;
+  int output_level = 0;
 
   // db_id is used to generate unique id of sst on the remote compactor
   std::string db_id;
@@ -395,6 +396,8 @@ struct CompactionServiceInput {
   std::string begin;
   bool has_end = false;
   std::string end;
+
+  uint64_t options_file_number = 0;
 
   // serialization interface to read and write the object
   static Status Read(const std::string& data_str, CompactionServiceInput* obj);
@@ -451,14 +454,11 @@ struct CompactionServiceOutputFile {
 struct CompactionServiceResult {
   Status status;
   std::vector<CompactionServiceOutputFile> output_files;
-  int output_level;
+  int output_level = 0;
 
   // location of the output files
   std::string output_path;
 
-  // some statistics about the compaction
-  uint64_t num_output_records = 0;
-  uint64_t total_bytes = 0;
   uint64_t bytes_read = 0;
   uint64_t bytes_written = 0;
   CompactionJobStats stats;
@@ -503,6 +503,9 @@ class CompactionServiceCompactionJob : private CompactionJob {
 
  protected:
   void RecordCompactionIOStats() override;
+
+  void UpdateCompactionJobStats(
+      const InternalStats::CompactionStats& stats) const override;
 
  private:
   // Get table file name in output_path
