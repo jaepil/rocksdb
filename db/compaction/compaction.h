@@ -406,6 +406,12 @@ class Compaction {
   }
 
   // start and end are sub compact range. Null if no boundary.
+  // This is used to calculate the newest_key_time table property after
+  // compaction.
+  uint64_t MaxInputFileNewestKeyTime(const InternalKey* start,
+                                     const InternalKey* end) const;
+
+  // start and end are sub compact range. Null if no boundary.
   // This is used to filter out some input files' ancester's time range.
   uint64_t MinInputFileOldestAncesterTime(const InternalKey* start,
                                           const InternalKey* end) const;
@@ -434,10 +440,11 @@ class Compaction {
   // penultimate level. The safe key range is populated by
   // `PopulatePenultimateLevelOutputRange()`.
   // Which could potentially disable all penultimate level output.
-  static int EvaluatePenultimateLevel(const VersionStorageInfo* vstorage,
-                                      const ImmutableOptions& immutable_options,
-                                      const int start_level,
-                                      const int output_level);
+  static int EvaluatePenultimateLevel(
+      const VersionStorageInfo* vstorage,
+      const MutableCFOptions& mutable_cf_options,
+      const ImmutableOptions& immutable_options, const int start_level,
+      const int output_level);
 
   // mark (or clear) all files that are being compacted
   void MarkFilesBeingCompacted(bool being_compacted) const;

@@ -288,8 +288,8 @@ void CompactionJob::Prepare() {
   // to encode seqno->time to the output files.
 
   uint64_t preserve_time_duration =
-      std::max(c->immutable_options()->preserve_internal_time_seconds,
-               c->immutable_options()->preclude_last_level_data_seconds);
+      std::max(c->mutable_cf_options()->preserve_internal_time_seconds,
+               c->mutable_cf_options()->preclude_last_level_data_seconds);
 
   if (preserve_time_duration > 0) {
     const ReadOptions read_options(Env::IOActivity::kCompaction);
@@ -326,8 +326,8 @@ void CompactionJob::Prepare() {
       seqno_to_time_mapping_.Enforce(_current_time);
       seqno_to_time_mapping_.GetCurrentTieringCutoffSeqnos(
           static_cast<uint64_t>(_current_time),
-          c->immutable_options()->preserve_internal_time_seconds,
-          c->immutable_options()->preclude_last_level_data_seconds,
+          c->mutable_cf_options()->preserve_internal_time_seconds,
+          c->mutable_cf_options()->preclude_last_level_data_seconds,
           &preserve_time_min_seqno_, &preclude_last_level_min_seqno_);
     }
     // For accuracy of the GetProximalSeqnoBeforeTime queries above, we only
@@ -1914,6 +1914,10 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
     oldest_ancester_time = current_time;
   }
 
+  uint64_t newest_key_time = sub_compact->compaction->MaxInputFileNewestKeyTime(
+      sub_compact->start.has_value() ? &tmp_start : nullptr,
+      sub_compact->end.has_value() ? &tmp_end : nullptr);
+
   // Initialize a SubcompactionState::Output and add it to sub_compact->outputs
   uint64_t epoch_number = sub_compact->compaction->MinInputFileEpochNumber();
   {
@@ -1963,7 +1967,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
       cfd->internal_tbl_prop_coll_factories(),
       sub_compact->compaction->output_compression(),
       sub_compact->compaction->output_compression_opts(), cfd->GetID(),
-      cfd->GetName(), sub_compact->compaction->output_level(),
+      cfd->GetName(), sub_compact->compaction->output_level(), newest_key_time,
       bottommost_level_, TableFileCreationReason::kCompaction,
       0 /* oldest_key_time */, current_time, db_id_, db_session_id_,
       sub_compact->compaction->max_output_file_size(), file_number,
