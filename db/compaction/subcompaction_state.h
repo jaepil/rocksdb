@@ -81,14 +81,8 @@ class SubcompactionState {
   // it returns both the last level outputs and penultimate level outputs.
   OutputIterator GetOutputs() const;
 
-  // Assign range dels aggregator, for each range_del, it can only be assigned
-  // to one output level, for per_key_placement, it's going to be the
-  // penultimate level.
-  // TODO: This does not work for per_key_placement + user-defined timestamp +
-  //  DeleteRange() combo. If user-defined timestamp is enabled,
-  //  it is possible for a range tombstone to belong to bottommost level (
-  //  seqno < earliest snapshot) without being dropped (garbage collection
-  //  for user-defined timestamp).
+  // Assign range dels aggregator. The various tombstones will potentially
+  // be filtered to different outputs.
   void AssignRangeDelAggregator(
       std::unique_ptr<CompactionRangeDelAggregator>&& range_del_agg) {
     assert(range_del_agg_ == nullptr);
@@ -148,20 +142,11 @@ class SubcompactionState {
         sub_job_id(state.sub_job_id),
         compaction_outputs_(std::move(state.compaction_outputs_)),
         penultimate_level_outputs_(std::move(state.penultimate_level_outputs_)),
-        is_current_penultimate_level_(state.is_current_penultimate_level_),
-        has_penultimate_level_outputs_(state.has_penultimate_level_outputs_),
         range_del_agg_(std::move(state.range_del_agg_)) {
-    current_outputs_ = is_current_penultimate_level_
-                           ? &penultimate_level_outputs_
-                           : &compaction_outputs_;
-  }
-
-  bool HasPenultimateLevelOutputs() const {
-    return has_penultimate_level_outputs_ || HasRangeDel();
-  }
-
-  bool IsCurrentPenultimateLevel() const {
-    return is_current_penultimate_level_;
+    current_outputs_ =
+        state.current_outputs_ == &state.penultimate_level_outputs_
+            ? &penultimate_level_outputs_
+            : &compaction_outputs_;
   }
 
   // Add all the new files from this compaction to version_edit
@@ -195,6 +180,7 @@ class SubcompactionState {
 
   // Add compaction_iterator key/value to the `Current` output group.
   Status AddToOutput(const CompactionIterator& iter,
+                     bool use_penultimate_output,
                      const CompactionFileOpenFunc& open_file_func,
                      const CompactionFileCloseFunc& close_file_func);
 
@@ -207,14 +193,16 @@ class SubcompactionState {
     // Call FinishCompactionOutputFile() even if status is not ok: it needs to
     // close the output file.
     // CloseOutput() may open new compaction output files.
-    is_current_penultimate_level_ = true;
-    Status s = penultimate_level_outputs_.CloseOutput(
-        curr_status, per_key ? range_del_agg_.get() : nullptr, open_file_func,
-        close_file_func);
-    is_current_penultimate_level_ = false;
-    s = compaction_outputs_.CloseOutput(
-        s, per_key ? nullptr : range_del_agg_.get(), open_file_func,
-        close_file_func);
+    Status s = curr_status;
+    if (per_key) {
+      s = penultimate_level_outputs_.CloseOutput(
+          s, range_del_agg_.get(), open_file_func, close_file_func);
+    } else {
+      assert(penultimate_level_outputs_.HasBuilder() == false);
+      assert(penultimate_level_outputs_.HasOutput() == false);
+    }
+    s = compaction_outputs_.CloseOutput(s, range_del_agg_.get(), open_file_func,
+                                        close_file_func);
     return s;
   }
 
@@ -223,8 +211,6 @@ class SubcompactionState {
   CompactionOutputs compaction_outputs_;
   CompactionOutputs penultimate_level_outputs_;
   CompactionOutputs* current_outputs_ = &compaction_outputs_;
-  bool is_current_penultimate_level_ = false;
-  bool has_penultimate_level_outputs_ = false;
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg_;
 };
 
