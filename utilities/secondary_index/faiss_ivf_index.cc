@@ -70,7 +70,8 @@ class FaissIVFIndex::KNNIterator : public Iterator {
     pos_ = 0;
     keys_.clear();
 
-    if (target.size() != index_->d * sizeof(float)) {
+    const float* const embedding = ConvertSliceToFloats(target, index_->d);
+    if (!embedding) {
       status_ = Status::InvalidArgument(
           "Incorrectly sized vector passed to FaissIVFIndex");
       return;
@@ -83,8 +84,8 @@ class FaissIVFIndex::KNNIterator : public Iterator {
     constexpr faiss::idx_t n = 1;
 
     try {
-      index_->search(n, reinterpret_cast<const float*>(target.data()), k_,
-                     distances_.data(), labels_.data(), &params);
+      index_->search(n, embedding, k_, distances_.data(), labels_.data(),
+                     &params);
     } catch (const std::exception& e) {
       status_ = Status::InvalidArgument(e.what());
     }
@@ -364,7 +365,9 @@ Status FaissIVFIndex::UpdatePrimaryColumnValue(
     const {
   assert(updated_column_value);
 
-  if (primary_column_value.size() != index_->d * sizeof(float)) {
+  const float* const embedding =
+      ConvertSliceToFloats(primary_column_value, index_->d);
+  if (!embedding) {
     return Status::InvalidArgument(
         "Incorrectly sized vector passed to FaissIVFIndex");
   }
@@ -373,8 +376,7 @@ Status FaissIVFIndex::UpdatePrimaryColumnValue(
   faiss::idx_t label = -1;
 
   try {
-    index_->quantizer->assign(
-        n, reinterpret_cast<const float*>(primary_column_value.data()), &label);
+    index_->quantizer->assign(n, embedding, &label);
   } catch (const std::exception& e) {
     return Status::InvalidArgument(e.what());
   }
@@ -390,7 +392,7 @@ Status FaissIVFIndex::UpdatePrimaryColumnValue(
 }
 
 Status FaissIVFIndex::GetSecondaryKeyPrefix(
-    const Slice& primary_column_value,
+    const Slice& /* primary_key */, const Slice& primary_column_value,
     std::variant<Slice, std::string>* secondary_key_prefix) const {
   assert(secondary_key_prefix);
 
@@ -404,8 +406,14 @@ Status FaissIVFIndex::GetSecondaryKeyPrefix(
   return Status::OK();
 }
 
+Status FaissIVFIndex::FinalizeSecondaryKeyPrefix(
+    std::variant<Slice, std::string>* /* secondary_key_prefix */) const {
+  return Status::OK();
+}
+
 Status FaissIVFIndex::GetSecondaryValue(
-    const Slice& primary_column_value, const Slice& original_column_value,
+    const Slice& /* primary_key */, const Slice& primary_column_value,
+    const Slice& original_column_value,
     std::optional<std::variant<Slice, std::string>>* secondary_value) const {
   assert(secondary_value);
 
@@ -414,13 +422,16 @@ Status FaissIVFIndex::GetSecondaryValue(
   assert(label < index_->nlist);
 
   constexpr faiss::idx_t n = 1;
+
+  const float* const embedding =
+      ConvertSliceToFloats(original_column_value, index_->d);
+  assert(embedding);
+
   constexpr faiss::idx_t* xids = nullptr;
   std::string code_str;
 
   try {
-    index_->add_core(
-        n, reinterpret_cast<const float*>(original_column_value.data()), xids,
-        &label, &code_str);
+    index_->add_core(n, embedding, xids, &label, &code_str);
   } catch (const std::exception& e) {
     return Status::InvalidArgument(e.what());
   }
@@ -451,10 +462,15 @@ std::unique_ptr<Iterator> FaissIVFIndex::NewIterator(
   }
 
   return std::make_unique<KNNIterator>(
-      index_.get(),
-      std::make_unique<SecondaryIndexIterator>(this, std::move(underlying_it)),
+      index_.get(), NewSecondaryIndexIterator(this, std::move(underlying_it)),
       *read_options.similarity_search_neighbors,
       *read_options.similarity_search_probes);
+}
+
+std::unique_ptr<SecondaryIndex> NewFaissIVFIndex(
+    std::unique_ptr<faiss::IndexIVF>&& index, std::string primary_column_name) {
+  return std::make_unique<FaissIVFIndex>(std::move(index),
+                                         std::move(primary_column_name));
 }
 
 }  // namespace ROCKSDB_NAMESPACE
