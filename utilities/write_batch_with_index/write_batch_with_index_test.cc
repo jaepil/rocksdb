@@ -15,7 +15,6 @@
 #include <memory>
 
 #include "db/column_family.h"
-#include "db/wide/wide_columns_helper.h"
 #include "memtable/wbwi_memtable.h"
 #include "port/stack_trace.h"
 #include "test_util/testharness.h"
@@ -23,7 +22,6 @@
 #include "util/random.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
-#include "utilities/merge_operators/string_append/stringappend.h"
 #include "utilities/write_batch_with_index/write_batch_with_index_internal.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -51,6 +49,7 @@ struct Entry {
 
 struct TestHandler : public WriteBatch::Handler {
   std::map<uint32_t, std::vector<Entry>> seen;
+  std::map<uint32_t, std::map<std::string, uint32_t>> cf_key_count;
   Status PutCF(uint32_t column_family_id, const Slice& key,
                const Slice& value) override {
     Entry e;
@@ -58,6 +57,7 @@ struct TestHandler : public WriteBatch::Handler {
     e.value = value.ToString();
     e.type = kPutRecord;
     seen[column_family_id].push_back(e);
+    cf_key_count[column_family_id][e.key]++;
     return Status::OK();
   }
   Status MergeCF(uint32_t column_family_id, const Slice& key,
@@ -67,6 +67,7 @@ struct TestHandler : public WriteBatch::Handler {
     e.value = value.ToString();
     e.type = kMergeRecord;
     seen[column_family_id].push_back(e);
+    cf_key_count[column_family_id][e.key]++;
     return Status::OK();
   }
   void LogData(const Slice& /*blob*/) override {}
@@ -76,6 +77,16 @@ struct TestHandler : public WriteBatch::Handler {
     e.value = "";
     e.type = kDeleteRecord;
     seen[column_family_id].push_back(e);
+    cf_key_count[column_family_id][e.key]++;
+    return Status::OK();
+  }
+  Status SingleDeleteCF(uint32_t column_family_id, const Slice& key) override {
+    Entry e;
+    e.key = key.ToString();
+    e.value = "";
+    e.type = kDeleteRecord;
+    seen[column_family_id].push_back(e);
+    cf_key_count[column_family_id][e.key]++;
     return Status::OK();
   }
 };
@@ -388,6 +399,33 @@ class WBWIBaseTest : public testing::Test {
       db_->ReleaseSnapshot(read_opts_.snapshot);
       read_opts_.snapshot = nullptr;
     }
+  }
+
+  void VerifyWBWIIterUpdateCount(ColumnFamilyHandle* cfh = nullptr) {
+    TestHandler handler;
+    ASSERT_OK(batch_->GetWriteBatch()->Iterate(&handler));
+    auto& count_map = handler.cf_key_count[GetColumnFamilyID(cfh)];
+    // handler for going through write batch
+    std::unique_ptr<WBWIIterator> iter(batch_->NewIterator(cfh));
+    iter->SeekToFirst();
+    size_t key_seen = 0;
+    while (iter->Valid()) {
+      ASSERT_OK(iter->status());
+      std::string key = iter->Entry().key.ToString();
+      auto count = count_map[key];
+      ASSERT_EQ(iter->GetUpdateCount(), count);
+      iter->Next();
+      // Merge is not overwritten when WBWI is created with overrwite_key
+      // We can only check for decreasing update count since the update before
+      // Merge can be overwritten multiple times.
+      while (iter->Valid() && key == iter->Entry().key.ToString()) {
+        ASSERT_GT(count, iter->GetUpdateCount());
+        count = iter->GetUpdateCount();
+        iter->Next();
+      }
+      ++key_seen;
+    }
+    ASSERT_EQ(key_seen, count_map.size());
   }
 
  public:
@@ -707,6 +745,9 @@ TEST_P(WriteBatchWithIndexTest, WBWIIteratorImpl) {
   // put then merge
   ASSERT_OK(batch_->Put("k3", "k3p0"));
   ASSERT_OK(batch_->Merge("k3", "k3m1"));
+  if (GetParam()) {
+    VerifyWBWIIterUpdateCount();
+  }
 
   std::unique_ptr<WBWIIteratorImpl> iter(
       static_cast<WBWIIteratorImpl*>(batch_->NewIterator()));
@@ -1021,6 +1062,9 @@ TEST_P(WriteBatchWithIndexTest, TestWBWIIterator) {
   ASSERT_OK(batch_->Delete(&cf2, "f"));
   AssertIterEqual(iter1.get(), {"a", "c", "e"});
   AssertIterEqual(iter2.get(), {"a", "b", "d", "f"});
+  if (GetParam()) {
+    VerifyWBWIIterUpdateCount();
+  }
 }
 
 TEST_P(WriteBatchWithIndexTest, TestRandomIteraratorWithBase) {
@@ -1142,6 +1186,11 @@ TEST_P(WriteBatchWithIndexTest, TestRandomIteraratorWithBase) {
     }
 
     ASSERT_OK(iter->status());
+    if (GetParam()) {
+      VerifyWBWIIterUpdateCount(&cf1);
+      VerifyWBWIIterUpdateCount(&cf2);
+      VerifyWBWIIterUpdateCount(&cf3);
+    }
   }
 }
 
@@ -1389,6 +1438,12 @@ TEST_P(WriteBatchWithIndexTest, TestIteraratorWithBaseReverseCmp) {
 
     iter->Seek("0");
     AssertIter(iter.get(), "a", "b");
+  }
+
+  if (GetParam()) {
+    VerifyWBWIIterUpdateCount();
+    VerifyWBWIIterUpdateCount(&cf1);
+    VerifyWBWIIterUpdateCount(&cf2);
   }
 }
 
@@ -1896,6 +1951,7 @@ TEST_F(WBWIOverwriteTest, MutateWhileIteratingBaseStressTest) {
     }
   }
   ASSERT_OK(iter->status());
+  VerifyWBWIIterUpdateCount();
 }
 
 TEST_P(WriteBatchWithIndexTest, TestNewIteratorWithBaseFromWbwi) {
@@ -3637,15 +3693,20 @@ TEST_P(WriteBatchWithIndexTest, TrackAndClearCFStats) {
 INSTANTIATE_TEST_CASE_P(WBWI, WriteBatchWithIndexTest, testing::Bool());
 
 std::string Get(const std::string& k, std::unique_ptr<WBWIMemTable>& wbwi_mem,
-                SequenceNumber snapshot_seq, bool* found_final_value) {
+                SequenceNumber snapshot_seq, bool* found_final_value,
+                MergeContext* merge_context = nullptr) {
   LookupKey lkey(k, snapshot_seq);
   std::string val;
   SequenceNumber max_range_del_seqno = 0;
   SequenceNumber out_seqno = 0;
   bool is_blob_index = false;
   Status s;
+  std::unique_ptr<MergeContext> merge_context_guard{new MergeContext};
+  if (merge_context == nullptr) {
+    merge_context = merge_context_guard.get();
+  }
   *found_final_value = wbwi_mem->Get(
-      lkey, &val, nullptr, nullptr, &s, nullptr, &max_range_del_seqno,
+      lkey, &val, nullptr, nullptr, &s, merge_context, &max_range_del_seqno,
       &out_seqno, ReadOptions(), true, nullptr, &is_blob_index, true);
   if (s.ok()) {
     if (*found_final_value) {
@@ -3653,10 +3714,11 @@ std::string Get(const std::string& k, std::unique_ptr<WBWIMemTable>& wbwi_mem,
       return val;
     }
     return "NOT_FOUND";
+  } else if (s.IsNotFound()) {
+    EXPECT_TRUE(*found_final_value);
+    return "NOT_FOUND";
   }
-  EXPECT_TRUE(s.IsNotFound());
-  EXPECT_TRUE(*found_final_value);
-  return "NOT_FOUND";
+  return s.ToString();
 }
 
 class WBWIMemTableTest : public testing::Test {};
@@ -3675,16 +3737,16 @@ TEST_F(WBWIMemTableTest, ReadFromWBWIMemtable) {
       cmp, 0, /*overwrite_key=*/true, 0, 0);
   wbwi->SetTrackPerCFStat(true);
   std::vector<std::pair<std::string, std::string>> expected;
-  expected.resize(10000);
-  for (int i = 0; i < 10000; ++i) {
+  const int kNumUpdate = 10000;
+  expected.resize(kNumUpdate);
+  for (int i = 0; i < kNumUpdate; ++i) {
     // Leave a non-existing key 9999 in between existing keys to test read.
     std::string key = i < 9999 ? DBTestBase::Key(i) : DBTestBase::Key(i + 1);
     bool del = rnd.OneIn(2);
     std::string val = del ? "NOT_FOUND" : rnd.RandomString(50);
     expected[i] = std::make_pair(key, val);
   }
-  // Random insertion order
-  RandomShuffle(expected.begin(), expected.end());
+
   std::unique_ptr<WBWIMemTable> wbwi_mem{
       new WBWIMemTable(wbwi, cmp,
                        /*cf_id=*/0, &immutable_opts, &mutable_cf_options,
@@ -3693,9 +3755,13 @@ TEST_F(WBWIMemTableTest, ReadFromWBWIMemtable) {
   ASSERT_TRUE(wbwi_mem->IsEmpty());
   constexpr SequenceNumber visible_seq = 10002;
   constexpr SequenceNumber non_visible_seq = 1;
-  constexpr WBWIMemTable::SeqnoRange assigned_seq = {2, 10001};
+  const SequenceNumber seqno_lb = 2;
+  constexpr WBWIMemTable::SeqnoRange assigned_seq = {seqno_lb,
+                                                     seqno_lb + kNumUpdate - 1};
   wbwi_mem->AssignSequenceNumbers(assigned_seq);
 
+  // Random insertion order
+  RandomShuffle(expected.begin(), expected.end());
   bool found_final_value = false;
   for (const auto& [key, val] : expected) {
     if (val == "NOT_FOUND") {
@@ -3719,28 +3785,38 @@ TEST_F(WBWIMemTableTest, ReadFromWBWIMemtable) {
   ColumnFamilyHandleImplDummy meta_cf(/*id=*/1, BytewiseComparator());
   ASSERT_OK(wbwi->Put(&meta_cf, DBTestBase::Key(0), "foo"));
 
-  RandomShuffle(expected.begin(), expected.end());
+  // Sort keys to compare with iterator
+  std::sort(expected.begin(), expected.end(),
+            [](const std::pair<std::string, std::string>& a,
+               const std::pair<std::string, std::string>& b) {
+              return a.first < b.first;
+            });
+
   // overwrites
+  std::vector<SequenceNumber> expected_seqno(kNumUpdate, seqno_lb);
   for (size_t i = 0; i < 2000; ++i) {
     // We don't expect to mix SD and DEL, or issue multiple SD consecutively in
     // a DB. Read from WBWI should still work so we do it here to keep the test
     // simple.
+    size_t idx = rnd.Uniform(kNumUpdate);
     if (rnd.OneIn(2)) {
       std::string val = rnd.RandomString(100);
-      expected[i].second = val;
-      ASSERT_OK(wbwi->Put(expected[i].first, val));
+      expected[idx].second = val;
+      ASSERT_OK(wbwi->Put(expected[idx].first, val));
     } else {
-      expected[i].second = "NOT_FOUND";
+      expected[idx].second = "NOT_FOUND";
       if (rnd.OneIn(2)) {
-        ASSERT_OK(wbwi->SingleDelete(expected[i].first));
+        ASSERT_OK(wbwi->SingleDelete(expected[idx].first));
       } else {
-        ASSERT_OK(wbwi->Delete(expected[i].first));
+        ASSERT_OK(wbwi->Delete(expected[idx].first));
       }
     }
     found_final_value = false;
-    ASSERT_TRUE(expected[i].second == Get(expected[i].first, wbwi_mem,
-                                          visible_seq, &found_final_value));
+    ASSERT_TRUE(expected[idx].second == Get(expected[idx].first, wbwi_mem,
+                                            visible_seq, &found_final_value));
     ASSERT_TRUE(found_final_value);
+    // See comment for WBWIMemTable for sequence number assignment method.
+    expected_seqno[idx]++;
   }
   // Get a non-existing key
   found_final_value = false;
@@ -3755,7 +3831,6 @@ TEST_F(WBWIMemTableTest, ReadFromWBWIMemtable) {
                              &found_final_value));
   ASSERT_FALSE(found_final_value);
   // Get existing keys
-  RandomShuffle(expected.begin(), expected.end());
   for (const auto& [key, val] : expected) {
     found_final_value = false;
     ASSERT_TRUE(val == Get(key, wbwi_mem, visible_seq, &found_final_value));
@@ -3814,12 +3889,6 @@ TEST_F(WBWIMemTableTest, ReadFromWBWIMemtable) {
     }
   }
 
-  // Sort keys to compare with iterator
-  std::sort(expected.begin(), expected.end(),
-            [](const std::pair<std::string, std::string>& a,
-               const std::pair<std::string, std::string>& b) {
-              return a.first < b.first;
-            });
   Arena arena;
   InternalIterator* iter = wbwi_mem->NewIterator(
       ReadOptions(), /*seqno_to_time_mapping=*/nullptr, &arena,
@@ -3835,7 +3904,7 @@ TEST_F(WBWIMemTableTest, ReadFromWBWIMemtable) {
     ValueType val_type;
     UnPackSequenceAndType(ExtractInternalKeyFooter(iter->key()), &seq,
                           &val_type);
-    ASSERT_EQ(seq, assigned_seq.upper_bound);
+    ASSERT_EQ(seq, expected_seqno[idx]);
     if (expected[idx].second == "NOT_FOUND") {
       ASSERT_TRUE(val_type == kTypeDeletion || val_type == kTypeSingleDeletion);
     } else {
@@ -3936,9 +4005,14 @@ TEST_F(WBWIMemTableTest, IterEmitSingleDelete) {
   ASSERT_OK(wbwi->SingleDelete(DBTestBase::Key(0)));
   ASSERT_OK(wbwi->SingleDelete(DBTestBase::Key(1)));
   ASSERT_OK(wbwi->SingleDelete(DBTestBase::Key(2)));
-  ASSERT_OK(wbwi->Put(DBTestBase::Key(3), "val3"));
   // SD at key1 overwritten
   ASSERT_OK(wbwi->Put(DBTestBase::Key(1), "val1"));
+  // For key3, most recent update is SD, and a SD is overwritten,
+  // here we test that these two SD get assigned different seqnos.
+  // FIXME: ideally we should only emit at most one SD per key.
+  ASSERT_OK(wbwi->SingleDelete(DBTestBase::Key(3)));
+  ASSERT_OK(wbwi->Put(DBTestBase::Key(3), "val3"));
+  ASSERT_OK(wbwi->SingleDelete(DBTestBase::Key(3)));
 
   std::unique_ptr<WBWIMemTable> wbwi_mem{
       new WBWIMemTable(wbwi, cmp,
@@ -3961,16 +4035,23 @@ TEST_F(WBWIMemTableTest, IterEmitSingleDelete) {
     ASSERT_TRUE(iter_for_flush->Valid());
     ASSERT_EQ(iter->key(), iter_for_flush->key());
 
-    iter->Next();
-    iter_for_flush->Next();
-    if (i == 1) {
-      // overwritten SD at key1
+    if (i == 1 || i == 3) {
+      // Most recent update should have a higher seqno than the overwritten SD
+      SequenceNumber current_seq;
+      ValueType _;
+      UnPackSequenceAndType(ExtractInternalKeyFooter(iter->key()), &current_seq,
+                            &_);
+      ASSERT_GT(current_seq, assigned_seqno.lower_bound);
+
+      iter_for_flush->Next();
+      // overwritten SD at key1 and key3
       // See WBWIMemTableIterator::UpdateSingleDeleteKey() for seqno assignment
-      InternalKey ikey(DBTestBase::Key(1), assigned_seqno.upper_bound - 1,
+      InternalKey ikey(DBTestBase::Key(i), assigned_seqno.lower_bound,
                        kTypeSingleDeletion);
       ASSERT_EQ(ikey.Encode(), iter_for_flush->key());
-      iter_for_flush->Next();
     }
+    iter->Next();
+    iter_for_flush->Next();
   }
   ASSERT_FALSE(iter->Valid());
   ASSERT_FALSE(iter_for_flush->Valid());
@@ -3978,6 +4059,177 @@ TEST_F(WBWIMemTableTest, IterEmitSingleDelete) {
   ASSERT_OK(iter_for_flush->status());
   iter->~InternalIterator();
   iter_for_flush->~InternalIteratorBase();
+}
+
+void VerifyIterator(
+    InternalIterator* iter,
+    const std::vector<std::pair<std::string, std::string>>& expected) {
+  // Verify SeekToFirst and Next
+  iter->SeekToFirst();
+  auto k = expected.begin();
+  while (iter->Valid()) {
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+
+    ASSERT_EQ(iter->key(), k->first);
+    ASSERT_EQ(iter->value(), k->second);
+
+    iter->Next();
+    ++k;
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(k == expected.end());
+
+  // Verify SeekToLast and Prev
+  iter->SeekToLast();
+  k = expected.end();
+  while (iter->Valid()) {
+    --k;
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+
+    ASSERT_EQ(iter->key(), k->first);
+    ASSERT_EQ(iter->value(), k->second);
+
+    iter->Prev();
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(k == expected.begin());
+
+  // Verify Seek and SeekForPrev
+  for (auto exp = expected.begin(); exp != expected.end(); ++exp) {
+    iter->Seek(exp->first);
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), exp->first);
+    ASSERT_EQ(iter->value(), exp->second);
+
+    iter->Next();
+    if (iter->Valid()) {
+      ASSERT_OK(iter->status());
+      ++exp;
+      ASSERT_EQ(iter->key(), exp->first);
+      ASSERT_EQ(iter->value(), exp->second);
+      iter->Prev();
+      --exp;
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->key(), exp->first);
+      ASSERT_EQ(iter->value(), exp->second);
+    } else {
+      iter->SeekToLast();
+    }
+
+    iter->SeekForPrev(exp->first);
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_OK(iter->status());
+    ASSERT_EQ(iter->key(), exp->first);
+    ASSERT_EQ(iter->value(), exp->second);
+
+    iter->Prev();
+    if (iter->Valid()) {
+      ASSERT_OK(iter->status());
+      --exp;
+      ASSERT_EQ(iter->key(), exp->first);
+      ASSERT_EQ(iter->value(), exp->second);
+      iter->Next();
+      ++exp;
+      ASSERT_TRUE(iter->Valid());
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(iter->key(), exp->first);
+      ASSERT_EQ(iter->value(), exp->second);
+    } else {
+      iter->SeekToFirst();
+    }
+  }
+}
+
+TEST_F(WBWIMemTableTest, WBWIMemTableWithMerge) {
+  const Comparator* cmp = BytewiseComparator();
+  Options opts;
+  opts.merge_operator = MergeOperators::CreateFromStringId("stringappend");
+  ImmutableOptions immutable_opts(opts);
+  MutableCFOptions mutable_cf_options(opts);
+
+  auto wbwi = std::make_shared<WriteBatchWithIndex>(
+      cmp, 0, /*overwrite_key=*/true, 0, 0);
+  wbwi->SetTrackPerCFStat(true);
+  std::unique_ptr<WBWIMemTable> wbwi_mem{
+      new WBWIMemTable(wbwi, cmp,
+                       /*cf_id=*/0, &immutable_opts, &mutable_cf_options,
+                       // stats is inaccurate but read path should still work
+                       /*stat=*/{})};
+  ASSERT_TRUE(wbwi_mem->IsEmpty());
+  constexpr SequenceNumber seqno_lb = 10;
+  constexpr SequenceNumber seqno_ub = 100;
+  constexpr WBWIMemTable::SeqnoRange assigned_seq = {seqno_lb, seqno_ub};
+  wbwi_mem->AssignSequenceNumbers(assigned_seq);
+
+  // Update then Merge
+  ASSERT_OK(wbwi->Put("a", "a1"));
+  ASSERT_OK(wbwi->Merge("a", "a2"));
+  ASSERT_OK(wbwi->Merge("a", "a3"));
+  ASSERT_OK(wbwi->Delete("b"));
+  ASSERT_OK(wbwi->Merge("b", "b1"));
+
+  // Merge then Update
+  ASSERT_OK(wbwi->Merge("c", "c1"));
+  ASSERT_OK(wbwi->Put("c", "c2"));
+  ASSERT_OK(wbwi->Merge("d", "d1"));
+  ASSERT_OK(wbwi->Merge("d", "d2"));
+  ASSERT_OK(wbwi->Delete("d"));
+
+  // Just Merge
+  ASSERT_OK(wbwi->Merge("e", "e1"));
+  ASSERT_OK(wbwi->Merge("f", "f1"));
+  ASSERT_OK(wbwi->Merge("f", "f2"));
+
+  // Just Update
+  ASSERT_OK(wbwi->SingleDelete("g"));
+
+  // key <-> val
+  // Refer to the sequence number assignment method described in the comments
+  // above the WBWIMemTable class.
+  std::vector<std::pair<std::string, std::string>> expected = {
+      {InternalKey("a", seqno_lb + 2, kTypeMerge).Encode().ToString(), "a3"},
+      {InternalKey("a", seqno_lb + 1, kTypeMerge).Encode().ToString(), "a2"},
+      {InternalKey("a", seqno_lb, kTypeValue).Encode().ToString(), "a1"},
+      {InternalKey("b", seqno_lb + 1, kTypeMerge).Encode().ToString(), "b1"},
+      {InternalKey("b", seqno_lb, kTypeDeletion).Encode().ToString(), ""},
+      {InternalKey("c", seqno_lb + 1, kTypeValue).Encode().ToString(), "c2"},
+      {InternalKey("d", seqno_lb + 2, kTypeDeletion).Encode().ToString(), ""},
+      {InternalKey("d", seqno_lb, kTypeMerge).Encode().ToString(), "d1"},
+      {InternalKey("e", seqno_lb, kTypeMerge).Encode().ToString(), "e1"},
+      {InternalKey("f", seqno_lb + 1, kTypeMerge).Encode().ToString(), "f2"},
+      {InternalKey("f", seqno_lb, kTypeMerge).Encode().ToString(), "f1"},
+      {InternalKey("g", seqno_lb, kTypeSingleDeletion).Encode().ToString(), ""},
+  };
+
+  Arena arena;
+  InternalIterator* iter = wbwi_mem->NewIterator(
+      ReadOptions(), /*seqno_to_time_mapping=*/nullptr, &arena,
+      /*prefix_extractor=*/nullptr, /*for_flush=*/false);
+  VerifyIterator(iter, expected);
+  iter->~InternalIterator();
+
+  // Test Get
+  bool found_final_value = false;
+  ASSERT_EQ("a1,a2,a3", Get("a", wbwi_mem, seqno_ub, &found_final_value));
+  ASSERT_EQ("b1", Get("b", wbwi_mem, seqno_ub, &found_final_value));
+  ASSERT_EQ("c2", Get("c", wbwi_mem, seqno_ub, &found_final_value));
+  ASSERT_EQ("NOT_FOUND", Get("d", wbwi_mem, seqno_ub, &found_final_value));
+  MergeContext merge_context;
+  ASSERT_EQ(Status::MergeInProgress().ToString(),
+            Get("e", wbwi_mem, seqno_ub, &found_final_value, &merge_context));
+  ASSERT_EQ(merge_context.GetNumOperands(), 1);
+  ASSERT_EQ(merge_context.GetOperand(0), "e1");
+  merge_context.Clear();
+  ASSERT_EQ(Status::MergeInProgress().ToString(),
+            Get("f", wbwi_mem, seqno_ub, &found_final_value, &merge_context));
+  ASSERT_EQ(merge_context.GetNumOperands(), 2);
+  ASSERT_EQ(merge_context.GetOperand(0), "f1");
+  ASSERT_EQ(merge_context.GetOperand(1), "f2");
+  ASSERT_EQ("NOT_FOUND", Get("g", wbwi_mem, seqno_ub, &found_final_value));
 }
 }  // namespace ROCKSDB_NAMESPACE
 
