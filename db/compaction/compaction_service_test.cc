@@ -1188,34 +1188,34 @@ TEST_F(CompactionServiceTest, PrecludeLastLevel) {
 
   for (int i = 0; i < kNumTrigger; i++) {
     for (int j = 0; j < kNumKeys; j++) {
-      // FIXME: need to assign outputs to levels to allow overlapping ranges:
-      // ASSERT_OK(Put(Key(j * kNumTrigger + i), "v" + std::to_string(i)));
-      // instead of this (too easy):
-      ASSERT_OK(Put(Key(i * kNumKeys + j), "v" + std::to_string(i)));
+      ASSERT_OK(Put(Key(j * kNumTrigger + i), "v" + std::to_string(i)));
     }
     ASSERT_OK(Flush());
   }
   ASSERT_OK(dbfull()->TEST_WaitForCompact());
 
-  // Data split between penultimate (kUnknown) and last (kCold) levels
-  // FIXME: need to assign outputs to levels to get this:
-  // ASSERT_EQ("0,0,0,0,0,1,1", FilesPerLevel());
-  // ASSERT_GT(GetSstSizeHelper(Temperature::kUnknown), 0);
-  // ASSERT_GT(GetSstSizeHelper(Temperature::kCold), 0);
-  // instead of this (WRONG but currently expected):
-  ASSERT_EQ("0,0,0,0,0,0,2", FilesPerLevel());
-  // Check manifest temperatures
+  // Data split between proximal (kUnknown) and last (kCold) levels
+  ASSERT_EQ("0,0,0,0,0,1,1", FilesPerLevel());
   ASSERT_GT(GetSstSizeHelper(Temperature::kUnknown), 0);
-  ASSERT_EQ(GetSstSizeHelper(Temperature::kCold), 0);
+  ASSERT_GT(GetSstSizeHelper(Temperature::kCold), 0);
+
   // TODO: Check FileSystem temperatures with FileTemperatureTestFS
 
   for (int i = 0; i < kNumTrigger; i++) {
     for (int j = 0; j < kNumKeys; j++) {
-      // FIXME
-      // ASSERT_EQ(Get(Key(j * kNumTrigger + i)), "v" + std::to_string(i));
-      ASSERT_EQ(Get(Key(i * kNumKeys + j)), "v" + std::to_string(i));
+      ASSERT_EQ(Get(Key(j * kNumTrigger + i)), "v" + std::to_string(i));
     }
   }
+
+  // Verify Output Stats
+  auto my_cs = GetCompactionService();
+  CompactionServiceResult result;
+  my_cs->GetResult(&result);
+  ASSERT_OK(result.status);
+  ASSERT_GT(result.stats.cpu_micros, 0);
+  ASSERT_GT(result.stats.elapsed_micros, 0);
+  ASSERT_EQ(result.stats.num_output_records, kNumTrigger * kNumKeys);
+  ASSERT_EQ(result.stats.num_output_files, 2);
 }
 
 TEST_F(CompactionServiceTest, ConcurrentCompaction) {
@@ -1469,6 +1469,40 @@ TEST_F(CompactionServiceTest, FallbackLocalManual) {
 
   // verify result after 2 manual compactions
   VerifyTestData();
+}
+
+TEST_F(CompactionServiceTest, AbortedWhileWait) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+  VerifyTestData();
+
+  auto my_cs = GetCompactionService();
+  Statistics* compactor_statistics = GetCompactorStatistics();
+  Statistics* primary_statistics = GetPrimaryStatistics();
+
+  my_cs->ResetOverride();
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+
+  // Override Wait() result with kAborted
+  my_cs->OverrideWaitStatus(CompactionServiceJobStatus::kAborted);
+  start_str = Key(120);
+  start = start_str;
+
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, nullptr);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsAborted());
+  // no remote compaction is run
+  ASSERT_EQ(my_cs->GetCompactionNum(), 0);
+  // make sure the compaction statistics is not recorded any side
+  ASSERT_EQ(primary_statistics->getTickerCount(COMPACT_WRITE_BYTES), 0);
+  ASSERT_EQ(primary_statistics->getTickerCount(REMOTE_COMPACT_WRITE_BYTES), 0);
+  ASSERT_EQ(compactor_statistics->getTickerCount(COMPACT_WRITE_BYTES), 0);
 }
 
 TEST_F(CompactionServiceTest, RemoteEventListener) {

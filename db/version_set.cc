@@ -4761,7 +4761,7 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
             cur_level_size <= base_bytes_min &&
             (options.preclude_last_level_data_seconds == 0 ||
              i < num_levels_ - 2)) {
-          // When per_key_placement is enabled, the penultimate level is
+          // When per_key_placement is enabled, the proximal level is
           // necessary.
           lowest_unnecessary_level_ = i;
         }
@@ -5114,7 +5114,7 @@ VersionSet::VersionSet(
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer, const std::string& db_id,
     const std::string& db_session_id, const std::string& daily_offpeak_time_utc,
-    ErrorHandler* const error_handler, const bool read_only)
+    ErrorHandler* error_handler, bool unchanging)
     : column_family_set_(new ColumnFamilySet(
           dbname, _db_options, storage_options, table_cache,
           write_buffer_manager, write_controller, block_cache_tracer, io_tracer,
@@ -5143,12 +5143,12 @@ VersionSet::VersionSet(
       db_session_id_(db_session_id),
       offpeak_time_option_(OffpeakTimeOption(daily_offpeak_time_utc)),
       error_handler_(error_handler),
-      read_only_(read_only),
+      unchanging_(unchanging),
       closed_(false) {}
 
 Status VersionSet::Close(FSDirectory* db_dir, InstrumentedMutex* mu) {
   Status s;
-  if (closed_ || read_only_ || !manifest_file_number_ || !descriptor_log_) {
+  if (closed_ || unchanging_ || !manifest_file_number_ || !descriptor_log_) {
     return s;
   }
 
@@ -5741,7 +5741,8 @@ Status VersionSet::ProcessManifestWrites(
       assert(new_cf_options != nullptr);
       assert(max_last_sequence == descriptor_last_sequence_);
       CreateColumnFamily(*new_cf_options, read_options,
-                         first_writer.edit_list.front());
+                         first_writer.edit_list.front(),
+                         /*read_only*/ false);
     } else if (first_writer.edit_list.front()->IsColumnFamilyDrop()) {
       assert(batch_edits.size() == 1);
       assert(max_last_sequence == descriptor_last_sequence_);
@@ -7294,8 +7295,10 @@ uint64_t VersionSet::GetObsoleteSstFilesSize() const {
 
 ColumnFamilyData* VersionSet::CreateColumnFamily(
     const ColumnFamilyOptions& cf_options, const ReadOptions& read_options,
-    const VersionEdit* edit) {
+    const VersionEdit* edit, bool read_only) {
   assert(edit->IsColumnFamilyAdd());
+  // Unchanging LSM tree implies no writes to the CF
+  assert(!unchanging_ || read_only);
 
   MutableCFOptions dummy_cf_options;
   Version* dummy_versions =
@@ -7305,7 +7308,7 @@ ColumnFamilyData* VersionSet::CreateColumnFamily(
   dummy_versions->Ref();
   auto new_cfd = column_family_set_->CreateColumnFamily(
       edit->GetColumnFamilyName(), edit->GetColumnFamily(), dummy_versions,
-      cf_options);
+      cf_options, read_only);
 
   Version* v = new Version(new_cfd, this, file_options_,
                            new_cfd->GetLatestMutableCFOptions(), io_tracer_,
@@ -7429,7 +7432,7 @@ ReactiveVersionSet::ReactiveVersionSet(
                  write_buffer_manager, write_controller,
                  /*block_cache_tracer=*/nullptr, io_tracer, /*db_id*/ "",
                  /*db_session_id*/ "", /*daily_offpeak_time_utc*/ "",
-                 /*error_handler=*/nullptr, /*read_only=*/true) {}
+                 /*error_handler=*/nullptr, /*unchanging=*/false) {}
 
 ReactiveVersionSet::~ReactiveVersionSet() = default;
 
