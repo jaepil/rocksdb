@@ -357,11 +357,12 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
   } else {
     ASSERT_OK(result.status);
   }
-  ASSERT_GE(result.stats.elapsed_micros, 1);
-  ASSERT_GE(result.stats.cpu_micros, 1);
+  ASSERT_GE(result.internal_stats.output_level_stats.micros, 1);
+  ASSERT_GE(result.internal_stats.output_level_stats.cpu_micros, 1);
 
-  ASSERT_EQ(20, result.stats.num_output_records);
-  ASSERT_EQ(result.output_files.size(), result.stats.num_output_files);
+  ASSERT_EQ(20, result.internal_stats.output_level_stats.num_output_records);
+  ASSERT_EQ(result.output_files.size(),
+            result.internal_stats.output_level_stats.num_output_files);
 
   uint64_t total_size = 0;
   for (auto output_file : result.output_files) {
@@ -372,7 +373,7 @@ TEST_F(CompactionServiceTest, BasicCompactions) {
     ASSERT_GT(file_size, 0);
     total_size += file_size;
   }
-  ASSERT_EQ(total_size, result.stats.total_output_bytes);
+  ASSERT_EQ(total_size, result.internal_stats.TotalBytesWritten());
 
   ASSERT_TRUE(result.stats.is_remote_compaction);
   ASSERT_TRUE(result.stats.is_manual_compaction);
@@ -714,6 +715,46 @@ TEST_F(CompactionServiceTest, VerifyStatsLocalFallback) {
   // Remote Compaction did not happen
   ASSERT_EQ(my_cs->GetCompactionNum(), comp_num);
   VerifyTestData();
+}
+
+TEST_F(CompactionServiceTest, VerifyInputRecordCount) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+  GenerateTestData();
+
+  auto my_cs = GetCompactionService();
+
+  std::string start_str = Key(15);
+  std::string end_str = Key(45);
+  Slice start(start_str);
+  Slice end(end_str);
+  uint64_t comp_num = my_cs->GetCompactionNum();
+
+  // Only iterator through 10 keys and force compaction to finish.
+  int num_iter = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::ProcessKeyValueCompaction()::stop", [&](void* stop_ptr) {
+        num_iter++;
+        if (num_iter == 10) {
+          *(bool*)stop_ptr = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // CompactRange() should fail
+  Status s = db_->CompactRange(CompactRangeOptions(), &start, &end);
+  ASSERT_NOK(s);
+  ASSERT_TRUE(s.IsCorruption());
+  const char* expected_message =
+      "Compaction number of input keys does not match number of keys "
+      "processed.";
+  ASSERT_TRUE(std::strstr(s.getState(), expected_message));
+
+  ASSERT_GE(my_cs->GetCompactionNum(), comp_num + 1);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_F(CompactionServiceTest, CorruptedOutput) {
@@ -1212,10 +1253,14 @@ TEST_F(CompactionServiceTest, PrecludeLastLevel) {
   CompactionServiceResult result;
   my_cs->GetResult(&result);
   ASSERT_OK(result.status);
-  ASSERT_GT(result.stats.cpu_micros, 0);
-  ASSERT_GT(result.stats.elapsed_micros, 0);
-  ASSERT_EQ(result.stats.num_output_records, kNumTrigger * kNumKeys);
-  ASSERT_EQ(result.stats.num_output_files, 2);
+  ASSERT_GT(result.internal_stats.output_level_stats.cpu_micros, 0);
+  ASSERT_GT(result.internal_stats.output_level_stats.micros, 0);
+  ASSERT_EQ(result.internal_stats.output_level_stats.num_output_records +
+                result.internal_stats.proximal_level_stats.num_output_records,
+            kNumTrigger * kNumKeys);
+  ASSERT_EQ(result.internal_stats.output_level_stats.num_output_files +
+                result.internal_stats.proximal_level_stats.num_output_files,
+            2);
 }
 
 TEST_F(CompactionServiceTest, ConcurrentCompaction) {
