@@ -842,6 +842,11 @@ DEFINE_bool(track_and_verify_wals,
 DEFINE_bool(enable_remote_compaction, false,
             "Enable (simulated) Remote Compaction");
 
+DEFINE_uint32(ingest_wbwi_one_in, 0,
+              "If set, will call"
+              "IngestWriteBatchWithIndex() instead of regular write operations "
+              "once every N writes.");
+
 static bool ValidateInt32Percent(const char* flagname, int32_t value) {
   if (value < 0 || value > 100) {
     fprintf(stderr, "Invalid value for --%s: %d, 0<= pct <=100 \n", flagname,
@@ -1468,5 +1473,10 @@ DEFINE_bool(
     auto_refresh_iterator_with_snapshot,
     ROCKSDB_NAMESPACE::ReadOptions().auto_refresh_iterator_with_snapshot,
     "ReadOptions.auto_refresh_iterator_with_snapshot");
+
+DEFINE_uint32(
+    memtable_op_scan_flush_trigger,
+    ROCKSDB_NAMESPACE::ColumnFamilyOptions().memtable_op_scan_flush_trigger,
+    "Sets CF option memtable_op_scan_flush_trigger.");
 
 #endif  // GFLAGS

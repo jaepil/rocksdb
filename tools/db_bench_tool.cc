@@ -1279,6 +1279,11 @@ DEFINE_bool(explicit_snapshot, false,
             "When set to true iterators will be initialized with explicit "
             "snapshot");
 
+DEFINE_uint32(memtable_op_scan_flush_trigger,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .memtable_op_scan_flush_trigger,
+              "Setting for CF option memtable_op_scan_flush_trigger.");
+
 static enum ROCKSDB_NAMESPACE::CompressionType StringToCompressionType(
     const char* ctype) {
   assert(ctype);
@@ -2909,8 +2914,7 @@ class Benchmark {
       CompressionOptions opts;
       CompressionContext context(FLAGS_compression_type_e, opts);
       CompressionInfo info(opts, context, CompressionDict::GetEmptyDict(),
-                           FLAGS_compression_type_e,
-                           FLAGS_sample_for_compression);
+                           FLAGS_compression_type_e);
       bool result = CompressSlice(info, Slice(input_str), &compressed);
 
       if (!result) {
@@ -4130,8 +4134,7 @@ class Benchmark {
     opts.level = FLAGS_compression_level;
     CompressionContext context(FLAGS_compression_type_e, opts);
     CompressionInfo info(opts, context, CompressionDict::GetEmptyDict(),
-                         FLAGS_compression_type_e,
-                         FLAGS_sample_for_compression);
+                         FLAGS_compression_type_e);
     // Compress 1G
     while (ok && bytes < int64_t(1) << 30) {
       compressed.clear();
@@ -4161,9 +4164,9 @@ class Benchmark {
     compression_opts.level = FLAGS_compression_level;
     CompressionContext compression_ctx(FLAGS_compression_type_e,
                                        compression_opts);
-    CompressionInfo compression_info(
-        compression_opts, compression_ctx, CompressionDict::GetEmptyDict(),
-        FLAGS_compression_type_e, FLAGS_sample_for_compression);
+    CompressionInfo compression_info(compression_opts, compression_ctx,
+                                     CompressionDict::GetEmptyDict(),
+                                     FLAGS_compression_type_e);
     UncompressionContext uncompression_ctx(FLAGS_compression_type_e);
     UncompressionInfo uncompression_info(uncompression_ctx,
                                          UncompressionDict::GetEmptyDict(),
@@ -4747,6 +4750,8 @@ class Benchmark {
     options.block_protection_bytes_per_key =
         FLAGS_block_protection_bytes_per_key;
     options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
+    options.memtable_op_scan_flush_trigger =
+        FLAGS_memtable_op_scan_flush_trigger;
   }
 
   void InitializeOptionsGeneral(Options* opts, ToolHooks& hooks) {
