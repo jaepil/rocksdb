@@ -106,8 +106,8 @@ class TestFSWritableFile : public FSWritableFile {
   const bool unsync_data_loss_;
 };
 
-// A wrapper around WritableFileWriter* file
-// is written to or sync'ed.
+// A wrapper around FSRandomRWFile* file
+// is read from/write to or sync'ed.
 class TestFSRandomRWFile : public FSRandomRWFile {
  public:
   explicit TestFSRandomRWFile(const std::string& fname,
@@ -128,6 +128,9 @@ class TestFSRandomRWFile : public FSRandomRWFile {
   bool use_direct_io() const override { return target_->use_direct_io(); }
 
  private:
+  // keep a copy of file name, so we can untrack it in File system, when it is
+  // closed
+  std::string fname_;
   std::unique_ptr<FSRandomRWFile> target_;
   bool file_opened_;
   FaultInjectionTestFS* fs_;
@@ -299,6 +302,10 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   IOStatus LinkFile(const std::string& src, const std::string& target,
                     const IOOptions& options, IODebugContext* dbg) override;
 
+  IOStatus SyncFile(const std::string& fname, const FileOptions& file_options,
+                    const IOOptions& io_options, bool use_fsync,
+                    IODebugContext* dbg) override;
+
   IOStatus NumFileLinks(const std::string& fname, const IOOptions& options,
                         uint64_t* count, IODebugContext* dbg) override;
 
@@ -340,6 +347,8 @@ class FaultInjectionTestFS : public FileSystemWrapper {
   void WritableFileSynced(const FSFileState& state);
 
   void WritableFileAppended(const FSFileState& state);
+
+  void RandomRWFileClosed(const std::string& fname);
 
   IOStatus DropUnsyncedFileData();
 
