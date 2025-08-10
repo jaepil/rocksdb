@@ -181,6 +181,7 @@ default_params = {
     "format_version": lambda: random.choice([2, 3, 4, 5, 6, 7, 7]),
     "index_block_restart_interval": lambda: random.choice(range(1, 16)),
     "use_multiget": lambda: random.randint(0, 1),
+    "use_multiscan": 0,
     "use_get_entity": lambda: random.choice([0] * 7 + [1]),
     "use_multi_get_entity": lambda: random.choice([0] * 7 + [1]),
     "periodic_compaction_seconds": lambda: random.choice([0, 0, 1, 2, 10, 100, 1000]),
@@ -342,8 +343,9 @@ default_params = {
     "use_timed_put_one_in": lambda: random.choice([0] * 7 + [1, 5, 10]),
     "universal_max_read_amp": lambda: random.choice([-1] * 3 + [0, 4, 10]),
     "paranoid_memory_checks": lambda: random.choice([0] * 7 + [1]),
-    "allow_unprepared_value": lambda: random.choice([0, 1]),
-    "enable_remote_compaction": lambda: random.choice([0, 1]),
+    "allow_unprepared_value": lambda: random.choice([0, 1]),    
+    # TODO(jaykorean): Re-enable remote compaction once all incompatible features are addressed in stress test
+    "remote_compaction_worker_threads": lambda: 0,
     "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
     "memtable_op_scan_flush_trigger": lambda: random.choice([0, 10, 100, 1000]),
     "memtable_avg_op_scan_flush_trigger": lambda: random.choice([0, 2, 20, 200]),
@@ -739,6 +741,7 @@ def finalize_and_sanitize(src_params):
         dest_params["metadata_write_fault_one_in"] = 0
         dest_params["read_fault_one_in"] = 0
         dest_params["metadata_read_fault_one_in"] = 0
+        dest_params["use_multiscan"] = 0
         if dest_params["prefix_size"] < 0:
             dest_params["prefix_size"] = 1
 
@@ -809,6 +812,14 @@ def finalize_and_sanitize(src_params):
             dest_params["allow_concurrent_memtable_write"] = 1
         else:
             dest_params["unordered_write"] = 0
+    if dest_params.get("remote_compaction_worker_threads", 0) > 0:
+       # TODO Fix races when both Remote Compaction + BlobDB enabled
+       dest_params["enable_blob_files"] = 0
+       # TODO Fix - Remote worker shouldn't recover from WAL
+       dest_params["disable_wal"] = 1
+       # Disable Incompatible Ones
+       dest_params["checkpoint_one_in"] = 0       
+       dest_params["use_timed_put_one_in"] = 0
     if dest_params.get("disable_wal", 0) == 1:
         dest_params["atomic_flush"] = 1
         dest_params["sync"] = 0
@@ -878,6 +889,8 @@ def finalize_and_sanitize(src_params):
         dest_params["use_multi_cf_iterator"] = 0
         # only works with write committed policy
         dest_params["commit_bypass_memtable_one_in"] = 0
+        # not compatible with Remote Compaction yet
+        dest_params["remote_compaction_worker_threads"] = 0
     # TODO(hx235): enable test_multi_ops_txns with fault injection after stabilizing the CI
     if dest_params.get("test_multi_ops_txns") == 1:
         dest_params["write_fault_one_in"] = 0
@@ -1008,6 +1021,9 @@ def finalize_and_sanitize(src_params):
             # have to disable metadata write fault injection to other file
             dest_params["exclude_wal_from_write_fault_injection"] = 1
             dest_params["metadata_write_fault_one_in"] = 0
+
+            # TODO Fix - Remote worker shouldn't recover from WAL 
+            dest_params["remote_compaction_worker_threads"] = 0
     # Disabling block align if mixed manager is being used
     if dest_params.get("compression_manager") == "custom":
         if dest_params.get("block_align") == 1:
@@ -1083,7 +1099,7 @@ def finalize_and_sanitize(src_params):
         dest_params["ingest_wbwi_one_in"] = 0
     # Continuous verification fails with secondaries inside NonBatchedOpsStressTest
     if dest_params.get("test_secondary") == 1:
-        dest_params["continuous_verification_interval"] = 0
+        dest_params["continuous_verification_interval"] = 0   
     return dest_params
 
 

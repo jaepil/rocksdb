@@ -111,8 +111,8 @@ class UserDefinedIndexBuilderWrapper : public IndexBuilder {
 
   size_t IndexSize() const override { return index_size_; }
 
-  bool seperator_is_key_plus_seq() override {
-    return internal_index_builder_->seperator_is_key_plus_seq();
+  bool separator_is_key_plus_seq() override {
+    return internal_index_builder_->separator_is_key_plus_seq();
   }
 
  private:
@@ -181,8 +181,11 @@ class UserDefinedIndexIteratorWrapper
 
   Status status() const override { return status_; }
 
-  void Prepare(const std::vector<ScanOptions>* scan_opts) override {
-    udi_iter_->Prepare(scan_opts->data(), scan_opts->size());
+  void Prepare(const MultiScanArgs* scan_opts) override {
+    if (scan_opts) {
+      udi_iter_->Prepare(scan_opts->GetScanRanges().data(),
+                         scan_opts->GetScanRanges().size());
+    }
   }
 
  private:

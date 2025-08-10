@@ -145,7 +145,8 @@ class CompactionIterator {
     }
 
     bool allow_ingest_behind() const override {
-      return compaction_->immutable_options().allow_ingest_behind;
+      return compaction_->immutable_options().cf_allow_ingest_behind ||
+             compaction_->immutable_options().allow_ingest_behind;
     }
 
     bool allow_mmap_reads() const override {
@@ -417,13 +418,15 @@ class CompactionIterator {
   // NextFromInput()).
   ParsedInternalKey ikey_;
 
-  // Stores whether ikey_.user_key is valid. If set to false, the user key is
-  // not compared against the current key in the underlying iterator.
+  // Stores whether current_user_key_ is valid. If so, current_user_key_
+  // stores the user key of the last key seen by the iterator.
+  // If false, treat the next key to read as a new user key.
   bool has_current_user_key_ = false;
   // If false, the iterator holds a copy of the current compaction iterator
   // output (or current key in the underlying iterator during NextFromInput()).
   bool at_next_ = false;
 
+  // A copy of the current internal key.
   IterKey current_key_;
   Slice current_user_key_;
   std::string curr_ts_;
@@ -433,8 +436,9 @@ class CompactionIterator {
   // True if the iterator has already returned a record for the current key.
   bool has_outputted_key_ = false;
 
-  // truncated the value of the next key and output it without applying any
-  // compaction rules.  This is used for outputting a put after a single delete.
+  // Truncate the value of the next key and output it without applying any
+  // compaction rules. This is an optimization for outputting a put after
+  // a single delete. See more in `NextFromInput()` under Optimization 3.
   bool clear_and_output_next_key_ = false;
 
   MergeOutputIterator merge_out_iter_;
