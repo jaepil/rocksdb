@@ -4751,6 +4751,15 @@ void rocksdb_options_add_compact_on_deletion_collector_factory_del_ratio(
   opt->rep.table_properties_collector_factories.emplace_back(compact_on_del);
 }
 
+void rocksdb_options_add_compact_on_deletion_collector_factory_min_file_size(
+    rocksdb_options_t* opt, size_t window_size, size_t num_dels_trigger,
+    double deletion_ratio, uint64_t min_file_size) {
+  std::shared_ptr<ROCKSDB_NAMESPACE::TablePropertiesCollectorFactory>
+      compact_on_del = NewCompactOnDeletionCollectorFactory(
+          window_size, num_dels_trigger, deletion_ratio, min_file_size);
+  opt->rep.table_properties_collector_factories.emplace_back(compact_on_del);
+}
+
 void rocksdb_set_perf_level(int v) {
   PerfLevel level = static_cast<PerfLevel>(v);
   SetPerfLevel(level);
@@ -6422,6 +6431,11 @@ void rocksdb_transactiondb_options_set_transaction_lock_timeout(
 void rocksdb_transactiondb_options_set_default_lock_timeout(
     rocksdb_transactiondb_options_t* opt, int64_t default_lock_timeout) {
   opt->rep.default_lock_timeout = default_lock_timeout;
+}
+
+void rocksdb_transactiondb_options_set_use_per_key_point_lock_mgr(
+    rocksdb_transactiondb_options_t* opt, int use_per_key_point_lock_mgr) {
+  opt->rep.use_per_key_point_lock_mgr = use_per_key_point_lock_mgr;
 }
 
 rocksdb_transaction_options_t* rocksdb_transaction_options_create() {

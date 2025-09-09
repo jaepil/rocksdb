@@ -53,6 +53,7 @@
 #include "rocksdb/trace_record.h"
 #include "rocksdb/unique_id.h"
 #include "rocksdb/user_defined_index.h"
+#include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_builder.h"
@@ -2059,7 +2060,7 @@ TEST_P(BlockBasedTableTest, PrefetchTest) {
 
   // Simple
   PrefetchRange(&c, &opt, &table_options,
-                /*key_range=*/"k01", "k05",
+                /*key_begin=*/"k01", /*key_end=*/"k05",
                 /*keys_in_cache=*/{"k01", "k02", "k03", "k04", "k05"},
                 /*keys_not_in_cache=*/{"k06", "k07"});
   PrefetchRange(&c, &opt, &table_options, "k01", "k01", {"k01", "k02", "k03"},
@@ -7479,8 +7480,14 @@ class UserDefinedIndexTest : public BlockBasedTableTestBase {
                           const Slice* first_key_in_next_block,
                           const BlockHandle& block_handle,
                           std::string* separator_scratch) override {
+        if (keys_added_ == 0) {
+          return last_key_in_current_block;
+        }
+        EXPECT_EQ(last_key_in_current_block.size(), 5);
+        if (first_key_in_next_block) {
+          EXPECT_EQ(first_key_in_next_block->size(), 5);
+        }
         // Unused parameters
-        (void)first_key_in_next_block;
         (void)separator_scratch;
         entries_added_++;
         // Store the block handle for each key
@@ -7494,13 +7501,21 @@ class UserDefinedIndexTest : public BlockBasedTableTestBase {
         return last_key_in_current_block;
       }
 
-      void OnKeyAdded(const Slice& /*key*/, ValueType /*value*/,
+      void OnKeyAdded(const Slice& key, ValueType /*value*/,
                       const Slice& /*value*/) override {
+        if (key.starts_with("dummy")) {
+          return;
+        }
+        EXPECT_EQ(key.size(), 5);
         // Track keys added to the index
         keys_added_++;
       }
 
       Status Finish(Slice* index_contents) override {
+        if (entries_added_ == 0) {
+          *index_contents = Slice();
+          return Status::OK();
+        }
         // Serialize the index data
         std::string result;
         for (const auto& entry : index_data_) {
@@ -7679,9 +7694,12 @@ class UserDefinedIndexTest : public BlockBasedTableTestBase {
           index_data_;
     };
   };
+
+ protected:
+  void BasicTest(bool use_partitioned_index);
 };
 
-TEST_F(UserDefinedIndexTest, BasicTest) {
+void UserDefinedIndexTest::BasicTest(bool use_partitioned_index) {
   Options options;
   BlockBasedTableOptions table_options;
   std::string dbname = test::PerThreadDBPath("user_defined_index_test");
@@ -7691,7 +7709,11 @@ TEST_F(UserDefinedIndexTest, BasicTest) {
   auto user_defined_index_factory =
       std::make_shared<TestUserDefinedIndexFactory>();
   table_options.user_defined_index_factory = user_defined_index_factory;
-
+  if (use_partitioned_index) {
+    table_options.partition_filters = true;
+    table_options.decouple_partitioned_filters = true;
+    table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+  }
   // Set up custom flush block policy that flushes every 3 keys
   table_options.flush_block_policy_factory =
       std::make_shared<CustomFlushBlockPolicyFactory>();
@@ -7831,6 +7853,14 @@ TEST_F(UserDefinedIndexTest, BasicTest) {
   // The index may undercount by 2 blocks
   ASSERT_LE(key_count, 30);
   ASSERT_OK(iter->status());
+}
+
+TEST_F(UserDefinedIndexTest, BasicTestWithPartitionedIndex) {
+  BasicTest(/*use_partitioned_index=*/true);
+}
+
+TEST_F(UserDefinedIndexTest, BasicTestWithoutPartitionedIndex) {
+  BasicTest(/*use_partitioned_index=*/false);
 }
 
 TEST_F(UserDefinedIndexTest, InvalidArgumentTest1) {
@@ -8000,6 +8030,7 @@ TEST_F(UserDefinedIndexTest, IngestTest) {
 
 // Verify that external file ingestion fails if we try to ingest an SST file
 // without the UDI and a UDI factory is configured in BlockBasedTableOptions
+// and fail_if_no_udi_on_open is true in BlockBasedTableOptions.
 TEST_F(UserDefinedIndexTest, IngestFailTest) {
   Options options;
   BlockBasedTableOptions table_options;
@@ -8031,6 +8062,7 @@ TEST_F(UserDefinedIndexTest, IngestFailTest) {
   auto user_defined_index_factory =
       std::make_shared<TestUserDefinedIndexFactory>();
   table_options.user_defined_index_factory = user_defined_index_factory;
+  table_options.fail_if_no_udi_on_open = true;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   std::unique_ptr<DB> db;
@@ -8044,6 +8076,158 @@ TEST_F(UserDefinedIndexTest, IngestFailTest) {
   IngestExternalFileOptions ifo;
   s = db->IngestExternalFile(cfh, {ingest_file}, ifo);
   ASSERT_NOK(s);
+
+  ASSERT_OK(db->SetOptions(
+      cfh, {{"block_based_table_factory", "{fail_if_no_udi_on_open=false;}"}}));
+  s = db->IngestExternalFile(cfh, {ingest_file}, ifo);
+  ASSERT_OK(s);
+
+  ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
+  ASSERT_OK(db->Close());
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST_F(UserDefinedIndexTest, IngestEmptyUDI) {
+  Options options;
+  BlockBasedTableOptions table_options;
+  std::string dbname = test::PerThreadDBPath("user_defined_index_test");
+  std::string ingest_file = dbname + "test.sst";
+  std::string ingest_file2 = dbname + "dummy.sst";
+
+  // Set up the user-defined index factory
+  auto user_defined_index_factory =
+      std::make_shared<TestUserDefinedIndexFactory>();
+  table_options.user_defined_index_factory = user_defined_index_factory;
+  // Set up custom flush block policy that flushes every 3 keys
+  table_options.flush_block_policy_factory =
+      std::make_shared<CustomFlushBlockPolicyFactory>();
+
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  std::unique_ptr<SstFileWriter> writer;
+  writer.reset(new SstFileWriter(EnvOptions(), options));
+  ASSERT_OK(writer->Open(ingest_file));
+
+  // Add 100 keys instead of just 5
+  for (int i = 0; i < 100; i++) {
+    std::stringstream ss;
+    ss << std::setw(2) << std::setfill('0') << i;
+    std::string key = "key" + ss.str();
+    std::string value = "value" + ss.str();
+    ASSERT_OK(writer->Put(key, value));
+  }
+  ASSERT_OK(writer->Finish());
+  writer.reset();
+  writer.reset(new SstFileWriter(EnvOptions(), options));
+  ASSERT_OK(writer->Open(ingest_file2));
+  ASSERT_OK(writer->Put("dummy", "val"));
+  ASSERT_OK(writer->Finish());
+  writer.reset();
+
+  table_options.fail_if_no_udi_on_open = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  std::unique_ptr<DB> db;
+  options.create_if_missing = true;
+  Status s = DB::Open(options, dbname, &db);
+  ASSERT_OK(s);
+  ASSERT_TRUE(db != nullptr);
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(options, "new_cf", &cfh));
+
+  std::vector<IngestExternalFileArg> ifa;
+  ifa.emplace_back();
+  ifa[0].column_family = cfh;
+  ifa[0].external_files.emplace_back(ingest_file);
+  ifa[0].external_files.emplace_back(ingest_file2);
+  s = db->IngestExternalFiles(ifa);
+  ASSERT_OK(s);
+
+  ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
+  ASSERT_OK(db->Close());
+  ASSERT_OK(DestroyDB(dbname, options));
+}
+
+TEST_F(UserDefinedIndexTest, ConfigTest) {
+  Options options;
+  BlockBasedTableOptions table_options;
+  std::string dbname = test::PerThreadDBPath("user_defined_index_test");
+  std::string ingest_file = dbname + "test.sst";
+
+  // Set up the user-defined index factory
+  auto user_defined_index_factory =
+      std::make_shared<TestUserDefinedIndexFactory>();
+  table_options.user_defined_index_factory = user_defined_index_factory;
+
+  // Set up custom flush block policy that flushes every 3 keys
+  table_options.flush_block_policy_factory =
+      std::make_shared<CustomFlushBlockPolicyFactory>();
+
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  std::unique_ptr<SstFileWriter> writer;
+  writer.reset(new SstFileWriter(EnvOptions(), options));
+  ASSERT_OK(writer->Open(ingest_file));
+
+  // Add 100 keys instead of just 5
+  for (int i = 0; i < 100; i++) {
+    std::stringstream ss;
+    ss << std::setw(2) << std::setfill('0') << i;
+    std::string key = "key" + ss.str();
+    std::string value = "value" + ss.str();
+    ASSERT_OK(writer->Put(key, value));
+  }
+  ASSERT_OK(writer->Finish());
+  writer.reset();
+
+  table_options.user_defined_index_factory.reset();
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  // Set up the user-defined index factory
+  ObjectLibrary::Default().get()->AddFactory<UserDefinedIndexFactory>(
+      "test_index", [](const std::string& /* uri */,
+                       std::unique_ptr<UserDefinedIndexFactory>* guard,
+                       std::string* /* errmsg */) {
+        auto factory = new TestUserDefinedIndexFactory();
+        guard->reset(factory);
+        return guard->get();
+      });
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      ConfigOptions(), options,
+      "block_based_table_factory={user_defined_index_factory=test_index;}",
+      &options));
+
+  std::unique_ptr<DB> db;
+  options.create_if_missing = true;
+  Status s = DB::Open(options, dbname, &db);
+  ASSERT_OK(s);
+  ASSERT_TRUE(db != nullptr);
+  ColumnFamilyHandle* cfh = nullptr;
+  ASSERT_OK(db->CreateColumnFamily(options, "new_cf", &cfh));
+
+  IngestExternalFileOptions ifo;
+  s = db->IngestExternalFile(cfh, {ingest_file}, ifo);
+  ASSERT_OK(s);
+
+  ReadOptions ro;
+  ro.table_index_factory = user_defined_index_factory.get();
+  std::unique_ptr<Iterator> iter(db->NewIterator(ro, cfh));
+  ASSERT_NE(iter, nullptr);
+  MultiScanArgs scan_opts;
+  std::unordered_map<std::string, std::string> property_bag;
+  property_bag["count"] = std::to_string(25);
+  scan_opts.insert(Slice("key20"), std::optional(property_bag));
+  iter->Prepare(scan_opts);
+  // Test that we can read all the keys
+  int key_count = 0;
+  for (iter->Seek(scan_opts.GetScanRanges()[0].range.start.value());
+       iter->Valid(); iter->Next()) {
+    key_count++;
+  }
+  ASSERT_GE(key_count, 25);
+  // The index may undercount by 2 blocks
+  ASSERT_LE(key_count, 30);
+  ASSERT_OK(iter->status());
+  iter.reset();
 
   ASSERT_OK(db->DestroyColumnFamilyHandle(cfh));
   ASSERT_OK(db->Close());

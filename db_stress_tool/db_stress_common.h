@@ -284,6 +284,7 @@ DECLARE_bool(use_txn);
 // Options for TransactionDB (a.k.a. Pessimistic Transaction DB)
 DECLARE_uint64(txn_write_policy);
 DECLARE_bool(unordered_write);
+DECLARE_bool(use_per_key_point_lock_mgr);
 
 // Options for OptimisticTransactionDB
 DECLARE_bool(use_optimistic_txn);
@@ -430,6 +431,13 @@ DECLARE_uint32(memtable_avg_op_scan_flush_trigger);
 DECLARE_uint32(ingest_wbwi_one_in);
 DECLARE_bool(universal_reduce_file_locking);
 DECLARE_bool(use_multiscan);
+
+// Compaction deletion trigger declarations for stress testing
+DECLARE_bool(enable_compaction_on_deletion_trigger);
+DECLARE_uint64(compaction_on_deletion_min_file_size);
+DECLARE_int32(compaction_on_deletion_trigger_count);
+DECLARE_int32(compaction_on_deletion_window_size);
+DECLARE_double(compaction_on_deletion_ratio);
 
 constexpr long KB = 1024;
 constexpr int kRandomValueMaxFactor = 3;

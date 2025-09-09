@@ -1966,7 +1966,9 @@ class DB {
   // In the first mode we will try to find the lowest possible level that
   // the file can fit in, and ingest the file into this level (2). A file that
   // have a key range that overlap with the memtable key range will require us
-  // to Flush the memtable first before ingesting the file.
+  // to Flush the memtable first before ingesting the file. If ingested files
+  // have any overlap with each other, level and sequence number assignment
+  // ensure later files overwrite earlier files.
   // In the second mode we will always ingest in the bottom most level (see
   // docs to IngestExternalFileOptions::ingest_behind).
   // For a column family that enables user-defined timestamps, ingesting
@@ -2245,12 +2247,9 @@ inline Status DB::GetApproximateSizes(ColumnFamilyHandle* column_family,
                                       uint64_t* sizes,
                                       SizeApproximationFlags include_flags) {
   SizeApproximationOptions options;
-  options.include_memtables =
-      ((include_flags & SizeApproximationFlags::INCLUDE_MEMTABLES) !=
-       SizeApproximationFlags::NONE);
-  options.include_files =
-      ((include_flags & SizeApproximationFlags::INCLUDE_FILES) !=
-       SizeApproximationFlags::NONE);
+  using enum SizeApproximationFlags;  // Require C++20 support
+  options.include_memtables = ((include_flags & INCLUDE_MEMTABLES) != NONE);
+  options.include_files = ((include_flags & INCLUDE_FILES) != NONE);
   return GetApproximateSizes(options, column_family, ranges, n, sizes);
 }
 
