@@ -11,21 +11,50 @@ import sys
 import tempfile
 import time
 
+per_iteration_random_seed_override = 0
+remain_argv = None
+
+
+def get_random_seed(override):
+    if override == 0:
+        return random.randint(1, 2**64)
+    else:
+        return override
+
 
 def setup_random_seed_before_main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--random_seed",
+        "--initial_random_seed_override",
         default=0,
         type=int,
-        help="Random seed used for reproduce the same test parameter set",
+        help="Random seed used for initialize the test parameters at the beginning of stress test run",
     )
-    args, _ = parser.parse_known_args()
-    random_seed = (
-        random.randint(1, 2**64) if args.random_seed == 0 else args.random_seed
+    # sometimes the failure appeared after a few iteration, to reproduce the error, we have to wait for the test to run
+    # multiple iterations to reach the iteration that fails the test. By overriding the seed used within each iteration,
+    # we could skip all the previous iterations.
+    parser.add_argument(
+        "--per_iteration_random_seed_override",
+        default=0,
+        type=int,
+        help="Random seed used for initialize the test parameters in each iteration of the stress test run",
     )
-    print(f"Start with random seed {random_seed}")
-    random.seed(random_seed)
+
+    global remain_args
+    args, remain_args = parser.parse_known_args()
+    init_random_seed = get_random_seed(args.initial_random_seed_override)
+    global per_iteration_random_seed_override
+    per_iteration_random_seed_override = args.per_iteration_random_seed_override
+
+    print(f"Start with random seed {init_random_seed}")
+    random.seed(init_random_seed)
+
+
+def apply_random_seed_per_iteration():
+    global per_iteration_random_seed_override
+    per_iteration_random_seed = get_random_seed(per_iteration_random_seed_override)
+    print(f"Use random seed for iteration {per_iteration_random_seed}")
+    random.seed(per_iteration_random_seed)
 
 
 # Random seed has to be setup before the rest of the script, so that the random
@@ -82,7 +111,7 @@ default_params = {
     ),
     "compression_max_dict_bytes": lambda: 16384 * random.randint(0, 1),
     "compression_zstd_max_train_bytes": lambda: 65536 * random.randint(0, 1),
-    "compression_parallel_threads": lambda: random.choice([1] * 3 + [4, 8, 16]),
+    "compression_parallel_threads": lambda: random.choice([1, 1, 2, 3, 4, 5, 8, 9, 16]),
     "compression_max_dict_buffer_bytes": lambda: (1 << random.randint(0, 40)) - 1,
     "compression_use_zstd_dict_trainer": lambda: random.randint(0, 1),
     "compression_checksum": lambda: random.randint(0, 1),
@@ -136,7 +165,7 @@ default_params = {
     "max_key": random.choice([100000, 25000000]),
     "max_sequential_skip_in_iterations": lambda: random.choice([1, 2, 8, 16]),
     "max_write_buffer_number": 3,
-    "mmap_read": lambda: random.randint(0, 1),
+    "mmap_read": lambda: random.choice([0, 0, 1]),
     # Setting `nooverwritepercent > 0` is only possible because we do not vary
     # the random seed, so the same keys are chosen by every run for disallowing
     # overwrites.
@@ -216,8 +245,9 @@ default_params = {
     # Test small max_manifest_file_size in a smaller chance, as most of the
     # time we wnat manifest history to be preserved to help debug
     "max_manifest_file_size": lambda: random.choice(
-        [t * 16384 if t < 3 else 1024 * 1024 * 1024 for t in range(1, 30)]
+        [t * 2048 if t < 5 else 1024 * 1024 * 1024 for t in range(1, 30)]
     ),
+    "max_manifest_space_amp_pct": lambda: random.choice([0, 10, 100, 1000]),
     # Sync mode might make test runs slower so running it in a smaller chance
     "sync": lambda: random.choice([1 if t == 0 else 0 for t in range(0, 20)]),
     "bytes_per_sync": lambda: random.choice([0, 262144]),
@@ -344,17 +374,21 @@ default_params = {
     "enable_sst_partitioner_factory": lambda: random.choice([0, 1]),
     "enable_do_not_compress_roles": lambda: random.choice([0, 1]),
     "block_align": lambda: random.choice([0, 1]),
+    "super_block_alignment_size": lambda: random.choice(
+        [0, 128 * 1024, 512 * 1024, 2 * 1024 * 1024]
+    ),
+    "super_block_alignment_space_overhead_ratio": lambda: random.choice([0, 32, 4096]),
     "lowest_used_cache_tier": lambda: random.choice([0, 1, 2]),
     "enable_custom_split_merge": lambda: random.choice([0, 1]),
     "adm_policy": lambda: random.choice([0, 1, 2, 3]),
     "last_level_temperature": lambda: random.choice(
-        ["kUnknown", "kHot", "kWarm", "kCold"]
+        ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
     "default_write_temperature": lambda: random.choice(
-        ["kUnknown", "kHot", "kWarm", "kCold"]
+        ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
     "default_temperature": lambda: random.choice(
-        ["kUnknown", "kHot", "kWarm", "kCold"]
+        ["kUnknown", "kHot", "kWarm", "kCool", "kCold", "kIce"]
     ),
     # TODO(hx235): enable `enable_memtable_insert_with_hint_prefix_extractor`
     # after fixing the surfaced issue with delete range
@@ -364,11 +398,14 @@ default_params = {
     "use_timed_put_one_in": lambda: random.choice([0] * 7 + [1, 5, 10]),
     "universal_max_read_amp": lambda: random.choice([-1] * 3 + [0, 4, 10]),
     "paranoid_memory_checks": lambda: random.choice([0] * 7 + [1]),
+    "memtable_veirfy_per_key_checksum_on_seek": lambda: random.choice([0] * 7 + [1]),
     "allow_unprepared_value": lambda: random.choice([0, 1]),
     # TODO(hx235): enable `track_and_verify_wals` after stabalizing the stress test
     "track_and_verify_wals": lambda: random.choice([0]),
-    # TODO(jaykorean): re-enable remote compaction worker threads after addressing all issues
-    "remote_compaction_worker_threads": 0,
+    "remote_compaction_worker_threads": lambda: random.choice([0, 8]),
+    "allow_resumption_one_in": lambda: random.choice([0, 1, 2, 20]),
+    # TODO(jaykorean): Change to lambda: random.choice([0, 1]) after addressing all remote compaction failures
+    "remote_compaction_failure_fall_back_to_local": 1,
     "auto_refresh_iterator_with_snapshot": lambda: random.choice([0, 1]),
     "memtable_op_scan_flush_trigger": lambda: random.choice([0, 10, 100, 1000]),
     "memtable_avg_op_scan_flush_trigger": lambda: random.choice([0, 2, 20, 200]),
@@ -386,6 +423,7 @@ default_params = {
     "use_multiscan": random.choice([1] + [0] * 3),
     # By default, `statistics` use kExceptDetailedTimers level
     "statistics": random.choice([0, 1]),
+    "multiscan_use_async_io": random.randint(0, 1),
 }
 
 _TEST_DIR_ENV_VAR = "TEST_TMPDIR"
@@ -630,9 +668,8 @@ blob_params = {
     "use_shared_block_and_blob_cache": lambda: random.randint(0, 1),
     "blob_cache_size": lambda: random.choice([1048576, 2097152, 4194304, 8388608]),
     "prepopulate_blob_cache": lambda: random.randint(0, 1),
-
-     # TODO Fix races when both Remote Compaction + BlobDB enabled
-     "remote_compaction_worker_threads": 0,
+    # TODO Fix races when both Remote Compaction + BlobDB enabled
+    "remote_compaction_worker_threads": 0,
 }
 
 ts_params = {
@@ -661,10 +698,11 @@ tiered_params = {
     "preclude_last_level_data_seconds": lambda: random.choice(
         [-1, -1, 10, 60, 1200, 86400]
     ),
-    "last_level_temperature": "kCold",
+    "last_level_temperature": lambda: random.choice(["kCold", "kIce"]),
     # For FIFO compaction (ignored otherwise)
     "file_temperature_age_thresholds": lambda: random.choice(
         [
+            "{{temperature=kWarm;age=10}:{temperature=kCool;age=30}:{temperature=kCold;age=100}:{temperature=kIce;age=300}}",
             "{{temperature=kWarm;age=30}:{temperature=kCold;age=300}}",
             "{{temperature=kCold;age=100}}",
         ]
@@ -756,6 +794,7 @@ def finalize_and_sanitize(src_params):
     if dest_params["mmap_read"] == 1:
         dest_params["use_direct_io_for_flush_and_compaction"] = 0
         dest_params["use_direct_reads"] = 0
+        dest_params["multiscan_use_async_io"] = 0
     if (
         dest_params["use_direct_io_for_flush_and_compaction"] == 1
         or dest_params["use_direct_reads"] == 1
@@ -772,7 +811,11 @@ def finalize_and_sanitize(src_params):
 
     if dest_params.get("memtablerep") == "vector":
         dest_params["inplace_update_support"] = 0
+
+    # only skip list memtable representation supports paranoid memory checks
+    if dest_params.get("memtablerep") != "skip_list":
         dest_params["paranoid_memory_checks"] = 0
+        dest_params["memtable_veirfy_per_key_checksum_on_seek"] = 0
 
     if dest_params["test_batches_snapshots"] == 1:
         dest_params["enable_compaction_filter"] = 0
@@ -803,6 +846,25 @@ def finalize_and_sanitize(src_params):
         dest_params["inplace_update_support"] = 0
         dest_params["checkpoint_one_in"] = 0
         dest_params["use_timed_put_one_in"] = 0
+        dest_params["test_secondary"] = 0
+        dest_params["mmap_read"] = 0
+
+        # Disable database open fault injection to prevent test inefficiency described below.
+        # When fault injection occurs during DB open, the db will wait for compaction
+        # to finish to clean up the database before retrying without injected error.
+        # However remote compaction threads are not yet created at that point
+        # so the db has to wait for the timeout (currently 30 seconds) to fall back to
+        # local compaction in order for the compaction to finish.
+        #
+        # TODO: Consider moving compaction thread creation earlier in the startup sequence
+        # to allow db open fault injection testing without this performance penalty
+        dest_params["open_metadata_write_fault_one_in"] = 0
+        dest_params["open_metadata_read_fault_one_in"] = 0
+        dest_params["open_write_fault_one_in"] = 0
+        dest_params["open_read_fault_one_in"] = 0
+        dest_params["sync_fault_injection"] = 0
+    else:
+        dest_params["allow_resumption_one_in"] = 0
 
     # Multi-key operations are not currently compatible with transactions or
     # timestamp.
@@ -1146,14 +1208,29 @@ def finalize_and_sanitize(src_params):
     # Continuous verification fails with secondaries inside NonBatchedOpsStressTest
     if dest_params.get("test_secondary") == 1:
         dest_params["continuous_verification_interval"] = 0
-    if (
-        dest_params.get("prefix_size", 0) > 0
-        or dest_params.get("read_fault_one_in", 0) > 0
-    ):
-        dest_params["use_multiscan"] = 0
     if dest_params.get("use_multiscan") == 1:
-        dest_params["fill_cache"] = 1
         dest_params["async_io"] = 0
+        dest_params["delpercent"] += dest_params["delrangepercent"]
+        dest_params["delrangepercent"] = 0
+        dest_params["prefix_size"] = -1
+        dest_params["iterpercent"] += dest_params["prefixpercent"]
+        dest_params["prefixpercent"] = 0
+        dest_params["read_fault_one_in"] = 0
+        dest_params["memtable_prefix_bloom_size_ratio"] = 0
+        dest_params["max_sequential_skip_in_iterations"] = sys.maxsize
+        # This option ingests a delete range that might partially overlap with
+        # existing key range, which will cause a reseek that's currently not
+        # supported by multiscan
+        dest_params["test_ingest_standalone_range_deletion_one_in"] = 0
+        # LevelIterator multiscan currently relies on num_entries and num_range_deletions,
+        # which are not updated if skip_stats_update_on_db_open is true
+        dest_params["skip_stats_update_on_db_open"] = 0
+
+    # inplace update and key checksum verification during seek would cause race condition
+    # Therefore, when inplace_update_support is enabled, disable memtable_veirfy_per_key_checksum_on_seek
+    if dest_params["inplace_update_support"] == 1:
+        dest_params["memtable_veirfy_per_key_checksum_on_seek"] = 0
+
     return dest_params
 
 
@@ -1222,7 +1299,6 @@ def gen_cmd(params, unknown_params):
             not in {
                 "test_type",
                 "simple",
-                "random_seed",
                 "duration",
                 "interval",
                 "random_kill_odd",
@@ -1306,6 +1382,7 @@ def blackbox_crash_main(args, unknown_args):
     )
 
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         cmd = gen_cmd(
             dict(list(cmd_params.items()) + list({"db": dbname}.items())), unknown_args
         )
@@ -1368,6 +1445,7 @@ def whitebox_crash_main(args, unknown_args):
     succeeded = True
     hit_timeout = False
     while time.time() < exit_time:
+        apply_random_seed_per_iteration()
         if check_mode == 0:
             additional_opts = {
                 # use large ops per thread since we will kill it anyway
@@ -1568,8 +1646,9 @@ def main():
     for k, v in all_params.items():
         parser.add_argument("--" + k, type=type(v() if callable(v) else v))
     # unknown_args are passed directly to db_stress
-    args, unknown_args = parser.parse_known_args()
 
+    global remain_args
+    args, unknown_args = parser.parse_known_args(remain_args)
     test_tmpdir = os.environ.get(_TEST_DIR_ENV_VAR)
     if test_tmpdir is not None and not args.skip_tmpdir_check:
         isdir = False

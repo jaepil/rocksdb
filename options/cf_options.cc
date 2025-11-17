@@ -395,6 +395,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, paranoid_file_checks),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"verify_output_flags",
+         {offsetof(struct MutableCFOptions, verify_output_flags),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"verify_checksums_in_compaction",
          {0, OptionType::kBoolean, OptionVerificationType::kDeprecated,
           OptionTypeFlags::kMutable}},
@@ -449,6 +453,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"target_file_size_multiplier",
          {offsetof(struct MutableCFOptions, target_file_size_multiplier),
           OptionType::kInt, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"target_file_size_is_upper_bound",
+         {offsetof(struct MutableCFOptions, target_file_size_is_upper_bound),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
         {"arena_block_size",
          {offsetof(struct MutableCFOptions, arena_block_size),
@@ -660,6 +668,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kMutable}},
         {"paranoid_memory_checks",
          {offsetof(struct MutableCFOptions, paranoid_memory_checks),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"memtable_veirfy_per_key_checksum_on_seek",
+         {offsetof(struct MutableCFOptions,
+                   memtable_veirfy_per_key_checksum_on_seek),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
         {kOptNameCompOpts,
@@ -1163,6 +1176,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  target_file_size_base);
   ROCKS_LOG_INFO(log, "              target_file_size_multiplier: %d",
                  target_file_size_multiplier);
+  ROCKS_LOG_INFO(log, "         target_file_size_is_upper_bound: %d",
+                 target_file_size_is_upper_bound);
   ROCKS_LOG_INFO(log, "                 max_bytes_for_level_base: %" PRIu64,
                  max_bytes_for_level_base);
   ROCKS_LOG_INFO(log, "           max_bytes_for_level_multiplier: %f",
@@ -1178,6 +1193,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  preserve_internal_time_seconds);
   ROCKS_LOG_INFO(log, "                   paranoid_memory_checks: %d",
                  paranoid_memory_checks);
+  ROCKS_LOG_INFO(log, "memtable_veirfy_per_key_checksum_on_seek: %d",
+                 memtable_veirfy_per_key_checksum_on_seek);
   std::string result;
   char buf[10];
   for (const auto m : max_bytes_for_level_multiplier_additional) {

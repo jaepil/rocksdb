@@ -425,6 +425,7 @@ rocks_cpp_library_wrapper(name="rocksdb_stress_lib", srcs=[
         "db_stress_tool/batched_ops_stress.cc",
         "db_stress_tool/cf_consistency_stress.cc",
         "db_stress_tool/db_stress_common.cc",
+        "db_stress_tool/db_stress_compaction_service.cc",
         "db_stress_tool/db_stress_compression_manager.cc",
         "db_stress_tool/db_stress_driver.cc",
         "db_stress_tool/db_stress_filters.cc",
@@ -4839,6 +4840,12 @@ cpp_unittest_wrapper(name="db_dynamic_level_test",
 
 cpp_unittest_wrapper(name="db_encryption_test",
             srcs=["db/db_encryption_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_etc3_test",
+            srcs=["db/db_etc3_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

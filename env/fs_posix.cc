@@ -1153,7 +1153,7 @@ class PosixFileSystem : public FileSystem {
     return IOStatus::OK();
 #else
     (void)io_handles;
-    return IOStatus::NotSupported("Poll");
+    return IOStatus::NotSupported("Poll not implemented");
 #endif
   }
 
@@ -1272,6 +1272,7 @@ class PosixFileSystem : public FileSystem {
       supported_ops |= (1 << FSSupportedOps::kAsyncIO);
     }
 #endif
+    supported_ops |= (1 << FSSupportedOps::kFSPrefetch);
   }
 
 #if defined(ROCKSDB_IOURING_PRESENT)

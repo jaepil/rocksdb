@@ -82,6 +82,7 @@ using ROCKSDB_NAMESPACE::DbPath;
 using ROCKSDB_NAMESPACE::Env;
 using ROCKSDB_NAMESPACE::EnvOptions;
 using ROCKSDB_NAMESPACE::EventListener;
+using ROCKSDB_NAMESPACE::ExportImportFilesMetaData;
 using ROCKSDB_NAMESPACE::ExternalFileIngestionInfo;
 using ROCKSDB_NAMESPACE::FileLock;
 using ROCKSDB_NAMESPACE::FilterPolicy;
@@ -89,6 +90,7 @@ using ROCKSDB_NAMESPACE::FlushJobInfo;
 using ROCKSDB_NAMESPACE::FlushOptions;
 using ROCKSDB_NAMESPACE::HistogramData;
 using ROCKSDB_NAMESPACE::HyperClockCacheOptions;
+using ROCKSDB_NAMESPACE::ImportColumnFamilyOptions;
 using ROCKSDB_NAMESPACE::InfoLogLevel;
 using ROCKSDB_NAMESPACE::IngestExternalFileOptions;
 using ROCKSDB_NAMESPACE::Iterator;
@@ -245,6 +247,9 @@ struct rocksdb_write_buffer_manager_t {
 struct rocksdb_sst_file_manager_t {
   std::shared_ptr<SstFileManager> rep;
 };
+struct rocksdb_livefile_t {
+  LiveFileMetaData rep;
+};
 struct rocksdb_livefiles_t {
   std::vector<LiveFileMetaData> rep;
 };
@@ -254,6 +259,12 @@ struct rocksdb_column_family_handle_t {
 };
 struct rocksdb_column_family_metadata_t {
   ColumnFamilyMetaData rep;
+};
+struct rocksdb_export_import_files_metadata_t {
+  ExportImportFilesMetaData* rep;
+};
+struct rocksdb_import_column_family_options_t {
+  ImportColumnFamilyOptions rep;
 };
 struct rocksdb_level_metadata_t {
   const LevelMetaData* rep;
@@ -624,10 +635,11 @@ static bool SaveError(char** errptr, const Status& s) {
   return true;
 }
 
-// Copies str to a new malloc()-ed buffer. The buffer is not NUL terminated.
-static char* CopyString(const std::string& str) {
-  char* result = reinterpret_cast<char*>(malloc(sizeof(char) * str.size()));
-  memcpy(result, str.data(), sizeof(char) * str.size());
+// Helper function to copy string data to a malloc'd buffer
+// Works with std::string, Slice, and PinnableSlice through implicit conversion
+static inline char* CopyString(const Slice& slice) {
+  char* result = reinterpret_cast<char*>(malloc(slice.size()));
+  memcpy(result, slice.data(), slice.size());
   return result;
 }
 
@@ -947,6 +959,22 @@ void rocksdb_checkpoint_create(rocksdb_checkpoint_t* checkpoint,
                         std::string(checkpoint_dir), log_size_for_flush));
 }
 
+rocksdb_export_import_files_metadata_t* rocksdb_checkpoint_export_column_family(
+    rocksdb_checkpoint_t* checkpoint,
+    rocksdb_column_family_handle_t* column_family, const char* export_dir,
+    char** errptr) {
+  ExportImportFilesMetaData* metadata = nullptr;
+  if (SaveError(errptr,
+                checkpoint->rep->ExportColumnFamily(
+                    column_family->rep, std::string(export_dir), &metadata))) {
+    return nullptr;
+  }
+  rocksdb_export_import_files_metadata_t* result =
+      new rocksdb_export_import_files_metadata_t;
+  result->rep = metadata;
+  return result;
+}
+
 void rocksdb_checkpoint_object_destroy(rocksdb_checkpoint_t* checkpoint) {
   delete checkpoint->rep;
   delete checkpoint;
@@ -1190,6 +1218,26 @@ rocksdb_column_family_handle_t** rocksdb_create_column_families(
   return c_handles;
 }
 
+rocksdb_column_family_handle_t* rocksdb_create_column_family_with_import(
+    rocksdb_t* db, rocksdb_options_t* column_family_options,
+    const char* column_family_name,
+    rocksdb_import_column_family_options_t* import_options,
+    rocksdb_export_import_files_metadata_t* export_import_files_metadata,
+    char** errptr) {
+  rocksdb_column_family_handle_t* handle = new rocksdb_column_family_handle_t;
+  handle->rep = nullptr;
+  if (SaveError(errptr,
+                db->rep->CreateColumnFamilyWithImport(
+                    ColumnFamilyOptions(column_family_options->rep),
+                    std::string(column_family_name), import_options->rep,
+                    *(export_import_files_metadata->rep), &(handle->rep)))) {
+    delete handle;
+    return nullptr;
+  }
+  handle->immortal = false;
+  return handle;
+}
+
 void rocksdb_create_column_families_destroy(
     rocksdb_column_family_handle_t** list) {
   free(list);
@@ -1393,11 +1441,14 @@ char* rocksdb_get(rocksdb_t* db, const rocksdb_readoptions_t* options,
                   const char* key, size_t keylen, size_t* vallen,
                   char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s = db->rep->Get(options->rep, Slice(key, keylen), &tmp);
+  // Use PinnableSlice to avoid unnecessary copy
+  PinnableSlice pinnable_val;
+  Status s = db->rep->Get(options->rep, db->rep->DefaultColumnFamily(),
+                          Slice(key, keylen), &pinnable_val);
   if (s.ok()) {
-    *vallen = tmp.size();
-    result = CopyString(tmp);
+    *vallen = pinnable_val.size();
+    // Only one copy: from PinnableSlice to malloc'd buffer
+    result = CopyString(pinnable_val);
   } else {
     *vallen = 0;
     if (!s.IsNotFound()) {
@@ -1412,12 +1463,14 @@ char* rocksdb_get_cf(rocksdb_t* db, const rocksdb_readoptions_t* options,
                      const char* key, size_t keylen, size_t* vallen,
                      char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s =
-      db->rep->Get(options->rep, column_family->rep, Slice(key, keylen), &tmp);
+  // Use PinnableSlice to avoid unnecessary copy
+  PinnableSlice pinnable_val;
+  Status s = db->rep->Get(options->rep, column_family->rep, Slice(key, keylen),
+                          &pinnable_val);
   if (s.ok()) {
-    *vallen = tmp.size();
-    result = CopyString(tmp);
+    *vallen = pinnable_val.size();
+    // Only one copy: from PinnableSlice to malloc'd buffer
+    result = CopyString(pinnable_val);
   } else {
     *vallen = 0;
     if (!s.IsNotFound()) {
@@ -1490,12 +1543,17 @@ void rocksdb_multi_get(rocksdb_t* db, const rocksdb_readoptions_t* options,
                        size_t num_keys, const char* const* keys_list,
                        const size_t* keys_list_sizes, char** values_list,
                        size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency (avoids vector overhead for fixed-size array)
+  std::unique_ptr<Slice[]> keys(new Slice[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
     keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<std::string> values(num_keys);
-  std::vector<Status> statuses = db->rep->MultiGet(options->rep, keys, &values);
+  // Use PinnableSlice to avoid unnecessary allocations
+  auto cfh = db->rep->DefaultColumnFamily();
+  std::vector<PinnableSlice> values(num_keys);
+  std::vector<Status> statuses(num_keys);
+  db->rep->MultiGet(options->rep, cfh, num_keys, keys.get(), values.data(),
+                    statuses.data());
   for (size_t i = 0; i < num_keys; i++) {
     if (statuses[i].ok()) {
       values_list[i] = CopyString(values[i]);
@@ -1520,10 +1578,13 @@ void rocksdb_multi_get_with_ts(rocksdb_t* db,
                                char** values_list, size_t* values_list_sizes,
                                char** timestamp_list,
                                size_t* timestamp_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys_arr(new Slice[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
-    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+    keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
+  // Note: MultiGet with timestamps only has vector-based API
+  std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<std::string> timestamps(num_keys);
   std::vector<Status> statuses =
@@ -1555,15 +1616,19 @@ void rocksdb_multi_get_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
-  std::vector<ColumnFamilyHandle*> cfs(num_keys);
+  // Use unique_ptr for efficiency (avoids vector overhead for fixed-size
+  // arrays)
+  std::unique_ptr<Slice[]> keys(new Slice[num_keys]);
+  std::unique_ptr<ColumnFamilyHandle*[]> cfs(new ColumnFamilyHandle*[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
     keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
-  std::vector<std::string> values(num_keys);
-  std::vector<Status> statuses =
-      db->rep->MultiGet(options->rep, cfs, keys, &values);
+  // Use PinnableSlice to avoid unnecessary allocations
+  std::vector<PinnableSlice> values(num_keys);
+  std::vector<Status> statuses(num_keys);
+  db->rep->MultiGet(options->rep, num_keys, cfs.get(), keys.get(),
+                    values.data(), statuses.data());
   for (size_t i = 0; i < num_keys; i++) {
     if (statuses[i].ok()) {
       values_list[i] = CopyString(values[i]);
@@ -1588,16 +1653,20 @@ void rocksdb_multi_get_cf_with_ts(
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** timestamps_list,
     size_t* timestamps_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
-  std::vector<ColumnFamilyHandle*> cfs(num_keys);
+  // Use unique_ptr for efficiency (avoids vector overhead for fixed-size
+  // arrays)
+  std::unique_ptr<Slice[]> keys(new Slice[num_keys]);
+  std::unique_ptr<ColumnFamilyHandle*[]> cfs(new ColumnFamilyHandle*[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
     keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
-  std::vector<std::string> values(num_keys);
+  // Use PinnableSlice to avoid unnecessary allocations
+  std::vector<PinnableSlice> values(num_keys);
   std::vector<std::string> timestamps(num_keys);
-  std::vector<Status> statuses =
-      db->rep->MultiGet(options->rep, cfs, keys, &values, &timestamps);
+  std::vector<Status> statuses(num_keys);
+  db->rep->MultiGet(options->rep, num_keys, cfs.get(), keys.get(),
+                    values.data(), timestamps.data(), statuses.data());
   for (size_t i = 0; i < num_keys; i++) {
     if (statuses[i].ok()) {
       values_list[i] = CopyString(values[i]);
@@ -1652,6 +1721,41 @@ void rocksdb_batched_multi_get_cf(rocksdb_t* db,
   }
 
   delete[] key_slices;
+  delete[] value_slices;
+  delete[] statuses;
+}
+
+// Batched MultiGet that takes pre-built Slice array, avoiding key conversion
+// overhead
+void rocksdb_batched_multi_get_cf_slice(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, size_t num_keys,
+    const rocksdb_slice_t* keys_list, rocksdb_pinnableslice_t** values,
+    char** errs, const bool sorted_input) {
+  PinnableSlice* value_slices = new PinnableSlice[num_keys];
+  Status* statuses = new Status[num_keys];
+
+  // Cast rocksdb_slice_t* to Slice* - they have identical memory layout
+  const Slice* key_slices = reinterpret_cast<const Slice*>(keys_list);
+
+  db->rep->MultiGet(options->rep, column_family->rep, num_keys, key_slices,
+                    value_slices, statuses, sorted_input);
+
+  for (size_t i = 0; i < num_keys; ++i) {
+    if (statuses[i].ok()) {
+      values[i] = new (rocksdb_pinnableslice_t);
+      values[i]->rep = std::move(value_slices[i]);
+      errs[i] = nullptr;
+    } else {
+      values[i] = nullptr;
+      if (!statuses[i].IsNotFound()) {
+        errs[i] = strdup(statuses[i].ToString().c_str());
+      } else {
+        errs[i] = nullptr;
+      }
+    }
+  }
+
   delete[] value_slices;
   delete[] statuses;
 }
@@ -2076,6 +2180,32 @@ void rocksdb_iter_get_error(const rocksdb_iterator_t* iter, char** errptr) {
   SaveError(errptr, iter->rep->status());
 }
 
+// Iterator functions that return rocksdb_slice_t directly for better
+// performance
+rocksdb_slice_t rocksdb_iter_key_slice(const rocksdb_iterator_t* iter) {
+  Slice s = iter->rep->key();
+  rocksdb_slice_t result;
+  result.data = s.data();
+  result.size = s.size();
+  return result;
+}
+
+rocksdb_slice_t rocksdb_iter_value_slice(const rocksdb_iterator_t* iter) {
+  Slice s = iter->rep->value();
+  rocksdb_slice_t result;
+  result.data = s.data();
+  result.size = s.size();
+  return result;
+}
+
+rocksdb_slice_t rocksdb_iter_timestamp_slice(const rocksdb_iterator_t* iter) {
+  Slice s = iter->rep->timestamp();
+  rocksdb_slice_t result;
+  result.data = s.data();
+  result.size = s.size();
+  return result;
+}
+
 void rocksdb_iter_refresh(const rocksdb_iterator_t* iter, char** errptr) {
   SaveError(errptr, iter->rep->Refresh());
 }
@@ -2131,16 +2261,18 @@ void rocksdb_writebatch_putv(rocksdb_writebatch_t* b, int num_keys,
                              const size_t* keys_list_sizes, int num_values,
                              const char* const* values_list,
                              const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::Put immediately copies the data
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep.Put(SliceParts(key_slices.data(), num_keys),
-             SliceParts(value_slices.data(), num_values));
+  b->rep.Put(SliceParts(key_slices.get(), num_keys),
+             SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_putv_cf(rocksdb_writebatch_t* b,
@@ -2149,16 +2281,18 @@ void rocksdb_writebatch_putv_cf(rocksdb_writebatch_t* b,
                                 const size_t* keys_list_sizes, int num_values,
                                 const char* const* values_list,
                                 const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::Put immediately copies the data
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep.Put(column_family->rep, SliceParts(key_slices.data(), num_keys),
-             SliceParts(value_slices.data(), num_values));
+  b->rep.Put(column_family->rep, SliceParts(key_slices.get(), num_keys),
+             SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_merge(rocksdb_writebatch_t* b, const char* key,
@@ -2178,16 +2312,18 @@ void rocksdb_writebatch_mergev(rocksdb_writebatch_t* b, int num_keys,
                                const size_t* keys_list_sizes, int num_values,
                                const char* const* values_list,
                                const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::Merge immediately copies the data
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep.Merge(SliceParts(key_slices.data(), num_keys),
-               SliceParts(value_slices.data(), num_values));
+  b->rep.Merge(SliceParts(key_slices.get(), num_keys),
+               SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_mergev_cf(rocksdb_writebatch_t* b,
@@ -2196,16 +2332,18 @@ void rocksdb_writebatch_mergev_cf(rocksdb_writebatch_t* b,
                                   const size_t* keys_list_sizes, int num_values,
                                   const char* const* values_list,
                                   const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::Merge immediately copies the data
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep.Merge(column_family->rep, SliceParts(key_slices.data(), num_keys),
-               SliceParts(value_slices.data(), num_values));
+  b->rep.Merge(column_family->rep, SliceParts(key_slices.get(), num_keys),
+               SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_delete(rocksdb_writebatch_t* b, const char* key,
@@ -2245,21 +2383,25 @@ void rocksdb_writebatch_singledelete_cf_with_ts(
 void rocksdb_writebatch_deletev(rocksdb_writebatch_t* b, int num_keys,
                                 const char* const* keys_list,
                                 const size_t* keys_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::Delete immediately copies the data
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  b->rep.Delete(SliceParts(key_slices.data(), num_keys));
+  b->rep.Delete(SliceParts(key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_deletev_cf(
     rocksdb_writebatch_t* b, rocksdb_column_family_handle_t* column_family,
     int num_keys, const char* const* keys_list, const size_t* keys_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::Delete immediately copies the data
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  b->rep.Delete(column_family->rep, SliceParts(key_slices.data(), num_keys));
+  b->rep.Delete(column_family->rep, SliceParts(key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_delete_range(rocksdb_writebatch_t* b,
@@ -2283,14 +2425,16 @@ void rocksdb_writebatch_delete_rangev(rocksdb_writebatch_t* b, int num_keys,
                                       const size_t* start_keys_list_sizes,
                                       const char* const* end_keys_list,
                                       const size_t* end_keys_list_sizes) {
-  std::vector<Slice> start_key_slices(num_keys);
-  std::vector<Slice> end_key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::DeleteRange immediately copies the data
+  std::unique_ptr<Slice[]> start_key_slices(new Slice[num_keys]);
+  std::unique_ptr<Slice[]> end_key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     start_key_slices[i] = Slice(start_keys_list[i], start_keys_list_sizes[i]);
     end_key_slices[i] = Slice(end_keys_list[i], end_keys_list_sizes[i]);
   }
-  b->rep.DeleteRange(SliceParts(start_key_slices.data(), num_keys),
-                     SliceParts(end_key_slices.data(), num_keys));
+  b->rep.DeleteRange(SliceParts(start_key_slices.get(), num_keys),
+                     SliceParts(end_key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_delete_rangev_cf(
@@ -2298,15 +2442,17 @@ void rocksdb_writebatch_delete_rangev_cf(
     int num_keys, const char* const* start_keys_list,
     const size_t* start_keys_list_sizes, const char* const* end_keys_list,
     const size_t* end_keys_list_sizes) {
-  std::vector<Slice> start_key_slices(num_keys);
-  std::vector<Slice> end_key_slices(num_keys);
+  // Use unique_ptr instead of vector to avoid overhead
+  // Safe because WriteBatch::DeleteRange immediately copies the data
+  std::unique_ptr<Slice[]> start_key_slices(new Slice[num_keys]);
+  std::unique_ptr<Slice[]> end_key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     start_key_slices[i] = Slice(start_keys_list[i], start_keys_list_sizes[i]);
     end_key_slices[i] = Slice(end_keys_list[i], end_keys_list_sizes[i]);
   }
   b->rep.DeleteRange(column_family->rep,
-                     SliceParts(start_key_slices.data(), num_keys),
-                     SliceParts(end_key_slices.data(), num_keys));
+                     SliceParts(start_key_slices.get(), num_keys),
+                     SliceParts(end_key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_put_log_data(rocksdb_writebatch_t* b, const char* blob,
@@ -2467,16 +2613,17 @@ void rocksdb_writebatch_wi_putv(rocksdb_writebatch_wi_t* b, int num_keys,
                                 const size_t* keys_list_sizes, int num_values,
                                 const char* const* values_list,
                                 const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr for better performance (avoids vector overhead)
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep->Put(SliceParts(key_slices.data(), num_keys),
-              SliceParts(value_slices.data(), num_values));
+  b->rep->Put(SliceParts(key_slices.get(), num_keys),
+              SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_wi_putv_cf(
@@ -2512,16 +2659,17 @@ void rocksdb_writebatch_wi_mergev(rocksdb_writebatch_wi_t* b, int num_keys,
                                   const size_t* keys_list_sizes, int num_values,
                                   const char* const* values_list,
                                   const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr for better performance (avoids vector overhead)
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep->Merge(SliceParts(key_slices.data(), num_keys),
-                SliceParts(value_slices.data(), num_values));
+  b->rep->Merge(SliceParts(key_slices.get(), num_keys),
+                SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_wi_mergev_cf(
@@ -2529,16 +2677,17 @@ void rocksdb_writebatch_wi_mergev_cf(
     int num_keys, const char* const* keys_list, const size_t* keys_list_sizes,
     int num_values, const char* const* values_list,
     const size_t* values_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr for better performance (avoids vector overhead)
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<Slice> value_slices(num_values);
+  std::unique_ptr<Slice[]> value_slices(new Slice[num_values]);
   for (int i = 0; i < num_values; i++) {
     value_slices[i] = Slice(values_list[i], values_list_sizes[i]);
   }
-  b->rep->Merge(column_family->rep, SliceParts(key_slices.data(), num_keys),
-                SliceParts(value_slices.data(), num_values));
+  b->rep->Merge(column_family->rep, SliceParts(key_slices.get(), num_keys),
+                SliceParts(value_slices.get(), num_values));
 }
 
 void rocksdb_writebatch_wi_delete(rocksdb_writebatch_wi_t* b, const char* key,
@@ -2576,11 +2725,12 @@ void rocksdb_writebatch_wi_deletev(rocksdb_writebatch_wi_t* b, int num_keys,
 void rocksdb_writebatch_wi_deletev_cf(
     rocksdb_writebatch_wi_t* b, rocksdb_column_family_handle_t* column_family,
     int num_keys, const char* const* keys_list, const size_t* keys_list_sizes) {
-  std::vector<Slice> key_slices(num_keys);
+  // Use unique_ptr for better performance (avoids vector overhead)
+  std::unique_ptr<Slice[]> key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     key_slices[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  b->rep->Delete(column_family->rep, SliceParts(key_slices.data(), num_keys));
+  b->rep->Delete(column_family->rep, SliceParts(key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_wi_delete_range(rocksdb_writebatch_wi_t* b,
@@ -2606,14 +2756,15 @@ void rocksdb_writebatch_wi_delete_rangev(rocksdb_writebatch_wi_t* b,
                                          const size_t* start_keys_list_sizes,
                                          const char* const* end_keys_list,
                                          const size_t* end_keys_list_sizes) {
-  std::vector<Slice> start_key_slices(num_keys);
-  std::vector<Slice> end_key_slices(num_keys);
+  // Use unique_ptr for better performance (avoids vector overhead)
+  std::unique_ptr<Slice[]> start_key_slices(new Slice[num_keys]);
+  std::unique_ptr<Slice[]> end_key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     start_key_slices[i] = Slice(start_keys_list[i], start_keys_list_sizes[i]);
     end_key_slices[i] = Slice(end_keys_list[i], end_keys_list_sizes[i]);
   }
-  b->rep->DeleteRange(SliceParts(start_key_slices.data(), num_keys),
-                      SliceParts(end_key_slices.data(), num_keys));
+  b->rep->DeleteRange(SliceParts(start_key_slices.get(), num_keys),
+                      SliceParts(end_key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_wi_delete_rangev_cf(
@@ -2621,15 +2772,16 @@ void rocksdb_writebatch_wi_delete_rangev_cf(
     int num_keys, const char* const* start_keys_list,
     const size_t* start_keys_list_sizes, const char* const* end_keys_list,
     const size_t* end_keys_list_sizes) {
-  std::vector<Slice> start_key_slices(num_keys);
-  std::vector<Slice> end_key_slices(num_keys);
+  // Use unique_ptr for better performance (avoids vector overhead)
+  std::unique_ptr<Slice[]> start_key_slices(new Slice[num_keys]);
+  std::unique_ptr<Slice[]> end_key_slices(new Slice[num_keys]);
   for (int i = 0; i < num_keys; i++) {
     start_key_slices[i] = Slice(start_keys_list[i], start_keys_list_sizes[i]);
     end_key_slices[i] = Slice(end_keys_list[i], end_keys_list_sizes[i]);
   }
   b->rep->DeleteRange(column_family->rep,
-                      SliceParts(start_key_slices.data(), num_keys),
-                      SliceParts(end_key_slices.data(), num_keys));
+                      SliceParts(start_key_slices.get(), num_keys),
+                      SliceParts(end_key_slices.get(), num_keys));
 }
 
 void rocksdb_writebatch_wi_put_log_data(rocksdb_writebatch_wi_t* b,
@@ -2747,12 +2899,13 @@ char* rocksdb_writebatch_wi_get_from_batch_and_db(
     const rocksdb_readoptions_t* options, const char* key, size_t keylen,
     size_t* vallen, char** errptr) {
   char* result = nullptr;
-  std::string tmp;
+  // Use PinnableSlice to avoid unnecessary allocations
+  PinnableSlice pinnable_val;
   Status s = wbwi->rep->GetFromBatchAndDB(db->rep, options->rep,
-                                          Slice(key, keylen), &tmp);
+                                          Slice(key, keylen), &pinnable_val);
   if (s.ok()) {
-    *vallen = tmp.size();
-    result = CopyString(tmp);
+    *vallen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vallen = 0;
     if (!s.IsNotFound()) {
@@ -2785,12 +2938,14 @@ char* rocksdb_writebatch_wi_get_from_batch_and_db_cf(
     rocksdb_column_family_handle_t* column_family, const char* key,
     size_t keylen, size_t* vallen, char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s = wbwi->rep->GetFromBatchAndDB(
-      db->rep, options->rep, column_family->rep, Slice(key, keylen), &tmp);
+  // Use PinnableSlice to avoid unnecessary allocations
+  PinnableSlice pinnable_val;
+  Status s =
+      wbwi->rep->GetFromBatchAndDB(db->rep, options->rep, column_family->rep,
+                                   Slice(key, keylen), &pinnable_val);
   if (s.ok()) {
-    *vallen = tmp.size();
-    result = CopyString(tmp);
+    *vallen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vallen = 0;
     if (!s.IsNotFound()) {
@@ -6209,6 +6364,10 @@ void rocksdb_options_set_min_level_to_compress(rocksdb_options_t* opt,
   }
 }
 
+rocksdb_livefiles_t* rocksdb_livefiles_create() {
+  return new rocksdb_livefiles_t;
+}
+
 int rocksdb_livefiles_count(const rocksdb_livefiles_t* lf) {
   return static_cast<int>(lf->rep.size());
 }
@@ -6220,6 +6379,16 @@ const char* rocksdb_livefiles_column_family_name(const rocksdb_livefiles_t* lf,
 
 const char* rocksdb_livefiles_name(const rocksdb_livefiles_t* lf, int index) {
   return lf->rep[index].name.c_str();
+}
+
+const char* rocksdb_livefiles_directory(const rocksdb_livefiles_t* lf,
+                                        int index) {
+  if (lf->rep[index].directory.empty()) {
+    // db_path is deprecated but still returned by some code paths
+    return lf->rep[index].db_path.c_str();
+  } else {
+    return lf->rep[index].directory.c_str();
+  }
 }
 
 int rocksdb_livefiles_level(const rocksdb_livefiles_t* lf, int index) {
@@ -6242,6 +6411,16 @@ const char* rocksdb_livefiles_largestkey(const rocksdb_livefiles_t* lf,
   return lf->rep[index].largestkey.data();
 }
 
+uint64_t rocksdb_livefiles_smallest_seqno(const rocksdb_livefiles_t* lf,
+                                          int index) {
+  return lf->rep[index].smallest_seqno;
+}
+
+uint64_t rocksdb_livefiles_largest_seqno(const rocksdb_livefiles_t* lf,
+                                         int index) {
+  return lf->rep[index].largest_seqno;
+}
+
 uint64_t rocksdb_livefiles_entries(const rocksdb_livefiles_t* lf, int index) {
   return lf->rep[index].num_entries;
 }
@@ -6251,6 +6430,71 @@ uint64_t rocksdb_livefiles_deletions(const rocksdb_livefiles_t* lf, int index) {
 }
 
 void rocksdb_livefiles_destroy(const rocksdb_livefiles_t* lf) { delete lf; }
+
+rocksdb_livefile_t* rocksdb_livefile_create() { return new rocksdb_livefile_t; }
+
+void rocksdb_livefile_set_column_family_name(rocksdb_livefile_t* lf,
+                                             const char* column_family_name) {
+  lf->rep.column_family_name = std::string(column_family_name);
+}
+
+void rocksdb_livefile_set_level(rocksdb_livefile_t* lf, int level) {
+  lf->rep.level = level;
+}
+
+void rocksdb_livefile_set_name(rocksdb_livefile_t* lf, const char* name) {
+  lf->rep.name = std::string(name);
+}
+
+void rocksdb_livefile_set_directory(rocksdb_livefile_t* lf,
+                                    const char* directory) {
+  lf->rep.directory = std::string(directory);
+  lf->rep.db_path = std::string(directory);  // deprecated but still needed
+}
+
+void rocksdb_livefile_set_size(rocksdb_livefile_t* lf, size_t size) {
+  lf->rep.size = size;
+}
+
+void rocksdb_livefile_set_smallest_key(rocksdb_livefile_t* lf,
+                                       const char* smallest_key,
+                                       size_t smallest_key_len) {
+  lf->rep.smallestkey = std::string(smallest_key, smallest_key_len);
+}
+
+void rocksdb_livefile_set_largest_key(rocksdb_livefile_t* lf,
+                                      const char* largest_key,
+                                      size_t largest_key_len) {
+  lf->rep.largestkey = std::string(largest_key, largest_key_len);
+}
+
+void rocksdb_livefile_set_smallest_seqno(rocksdb_livefile_t* lf,
+                                         uint64_t smallest_seqno) {
+  lf->rep.smallest_seqno = smallest_seqno;
+}
+
+void rocksdb_livefile_set_largest_seqno(rocksdb_livefile_t* lf,
+                                        uint64_t largest_seqno) {
+  lf->rep.largest_seqno = largest_seqno;
+}
+
+void rocksdb_livefile_set_num_entries(rocksdb_livefile_t* lf,
+                                      uint64_t num_entries) {
+  lf->rep.num_entries = num_entries;
+}
+
+void rocksdb_livefile_set_num_deletions(rocksdb_livefile_t* lf,
+                                        uint64_t num_deletions) {
+  lf->rep.num_deletions = num_deletions;
+}
+
+void rocksdb_livefile_destroy(rocksdb_livefile_t* lf) { delete lf; }
+
+void rocksdb_livefiles_add(rocksdb_livefiles_t* lf,
+                           rocksdb_livefile_t* livefile) {
+  lf->rep.push_back(std::move(livefile->rep));
+  delete livefile;
+}
 
 void rocksdb_get_options_from_string(const rocksdb_options_t* base_options,
                                      const char* opts_str,
@@ -6400,6 +6644,58 @@ char* rocksdb_sst_file_metadata_get_largestkey(
     rocksdb_sst_file_metadata_t* file_meta, size_t* key_len) {
   *key_len = file_meta->rep->largestkey.size();
   return CopyString(file_meta->rep->largestkey);
+}
+
+rocksdb_import_column_family_options_t*
+rocksdb_import_column_family_options_create() {
+  return new rocksdb_import_column_family_options_t;
+}
+
+void rocksdb_import_column_family_options_set_move_files(
+    rocksdb_import_column_family_options_t* opt, unsigned char v) {
+  opt->rep.move_files = v;
+}
+
+void rocksdb_import_column_family_options_destroy(
+    rocksdb_import_column_family_options_t* metadata) {
+  delete metadata;
+}
+
+rocksdb_export_import_files_metadata_t*
+rocksdb_export_import_files_metadata_create() {
+  auto metadata = new rocksdb_export_import_files_metadata_t;
+  metadata->rep = new ExportImportFilesMetaData;
+  return metadata;
+}
+
+char* rocksdb_export_import_files_metadata_get_db_comparator_name(
+    rocksdb_export_import_files_metadata_t* metadata) {
+  return strdup(metadata->rep->db_comparator_name.c_str());
+}
+
+void rocksdb_export_import_files_metadata_set_db_comparator_name(
+    rocksdb_export_import_files_metadata_t* metadata, const char* name) {
+  metadata->rep->db_comparator_name = std::string(name);
+}
+
+rocksdb_livefiles_t* rocksdb_export_import_files_metadata_get_files(
+    rocksdb_export_import_files_metadata_t* export_import_metadata) {
+  auto files = new rocksdb_livefiles_t;
+  files->rep = std::vector(export_import_metadata->rep->files);
+  return files;
+}
+
+void rocksdb_export_import_files_metadata_set_files(
+    rocksdb_export_import_files_metadata_t* metadata,
+    rocksdb_livefiles_t* files) {
+  metadata->rep->files = std::move(files->rep);
+  delete files;
+}
+
+void rocksdb_export_import_files_metadata_destroy(
+    rocksdb_export_import_files_metadata_t* metadata) {
+  delete metadata->rep;
+  delete metadata;
 }
 
 /* Transactions */
@@ -6734,11 +7030,11 @@ char* rocksdb_transaction_get(rocksdb_transaction_t* txn,
                               const char* key, size_t klen, size_t* vlen,
                               char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s = txn->rep->Get(options->rep, Slice(key, klen), &tmp);
+  PinnableSlice pinnable_val;
+  Status s = txn->rep->Get(options->rep, Slice(key, klen), &pinnable_val);
   if (s.ok()) {
-    *vlen = tmp.size();
-    result = CopyString(tmp);
+    *vlen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vlen = 0;
     if (!s.IsNotFound()) {
@@ -6769,12 +7065,12 @@ char* rocksdb_transaction_get_cf(rocksdb_transaction_t* txn,
                                  const char* key, size_t klen, size_t* vlen,
                                  char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s =
-      txn->rep->Get(options->rep, column_family->rep, Slice(key, klen), &tmp);
+  PinnableSlice pinnable_val;
+  Status s = txn->rep->Get(options->rep, column_family->rep, Slice(key, klen),
+                           &pinnable_val);
   if (s.ok()) {
-    *vlen = tmp.size();
-    result = CopyString(tmp);
+    *vlen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vlen = 0;
     if (!s.IsNotFound()) {
@@ -6808,12 +7104,12 @@ char* rocksdb_transaction_get_for_update(rocksdb_transaction_t* txn,
                                          size_t* vlen, unsigned char exclusive,
                                          char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s =
-      txn->rep->GetForUpdate(options->rep, Slice(key, klen), &tmp, exclusive);
+  PinnableSlice pinnable_val;
+  Status s = txn->rep->GetForUpdate(options->rep, Slice(key, klen),
+                                    &pinnable_val, exclusive);
   if (s.ok()) {
-    *vlen = tmp.size();
-    result = CopyString(tmp);
+    *vlen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vlen = 0;
     if (!s.IsNotFound()) {
@@ -6845,12 +7141,12 @@ char* rocksdb_transaction_get_for_update_cf(
     rocksdb_column_family_handle_t* column_family, const char* key, size_t klen,
     size_t* vlen, unsigned char exclusive, char** errptr) {
   char* result = nullptr;
-  std::string tmp;
+  PinnableSlice pinnable_val;
   Status s = txn->rep->GetForUpdate(options->rep, column_family->rep,
-                                    Slice(key, klen), &tmp, exclusive);
+                                    Slice(key, klen), &pinnable_val, exclusive);
   if (s.ok()) {
-    *vlen = tmp.size();
-    result = CopyString(tmp);
+    *vlen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vlen = 0;
     if (!s.IsNotFound()) {
@@ -6884,10 +7180,13 @@ void rocksdb_transaction_multi_get(rocksdb_transaction_t* txn,
                                    const size_t* keys_list_sizes,
                                    char** values_list,
                                    size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys_arr(new Slice[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
-    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+    keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
+  // Note: Transaction only has vector-based MultiGet API
+  std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
       txn->rep->MultiGet(options->rep, keys, &values);
@@ -6913,10 +7212,14 @@ void rocksdb_transaction_multi_get_for_update(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys_arr(new Slice[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
-    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+    keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
+  // Note: GetForUpdate only has vector-based API, no array-based PinnableSlice
+  // variant
+  std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
       txn->rep->MultiGetForUpdate(options->rep, keys, &values);
@@ -6943,12 +7246,15 @@ void rocksdb_transaction_multi_get_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys_arr(new Slice[num_keys]);
   std::vector<ColumnFamilyHandle*> cfs(num_keys);
   for (size_t i = 0; i < num_keys; i++) {
-    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+    keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
+  // Note: Transaction only has vector-based MultiGet API
+  std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
       txn->rep->MultiGet(options->rep, cfs, keys, &values);
@@ -6975,12 +7281,16 @@ void rocksdb_transaction_multi_get_for_update_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys_arr(new Slice[num_keys]);
   std::vector<ColumnFamilyHandle*> cfs(num_keys);
   for (size_t i = 0; i < num_keys; i++) {
-    keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
+    keys_arr[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
+  // Note: GetForUpdate only has vector-based API, no array-based PinnableSlice
+  // variant
+  std::vector<Slice> keys(keys_arr.get(), keys_arr.get() + num_keys);
   std::vector<std::string> values(num_keys);
   std::vector<Status> statuses =
       txn->rep->MultiGetForUpdate(options->rep, cfs, keys, &values);
@@ -7007,11 +7317,12 @@ char* rocksdb_transactiondb_get(rocksdb_transactiondb_t* txn_db,
                                 const char* key, size_t klen, size_t* vlen,
                                 char** errptr) {
   char* result = nullptr;
-  std::string tmp;
-  Status s = txn_db->rep->Get(options->rep, Slice(key, klen), &tmp);
+  PinnableSlice pinnable_val;
+  Status s = txn_db->rep->Get(options->rep, txn_db->rep->DefaultColumnFamily(),
+                              Slice(key, klen), &pinnable_val);
   if (s.ok()) {
-    *vlen = tmp.size();
-    result = CopyString(tmp);
+    *vlen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vlen = 0;
     if (!s.IsNotFound()) {
@@ -7042,12 +7353,12 @@ char* rocksdb_transactiondb_get_cf(
     rocksdb_column_family_handle_t* column_family, const char* key,
     size_t keylen, size_t* vallen, char** errptr) {
   char* result = nullptr;
-  std::string tmp;
+  PinnableSlice pinnable_val;
   Status s = txn_db->rep->Get(options->rep, column_family->rep,
-                              Slice(key, keylen), &tmp);
+                              Slice(key, keylen), &pinnable_val);
   if (s.ok()) {
-    *vallen = tmp.size();
-    result = CopyString(tmp);
+    *vallen = pinnable_val.size();
+    result = CopyString(pinnable_val);
   } else {
     *vallen = 0;
     if (!s.IsNotFound()) {
@@ -7081,13 +7392,17 @@ void rocksdb_transactiondb_multi_get(rocksdb_transactiondb_t* txn_db,
                                      const size_t* keys_list_sizes,
                                      char** values_list,
                                      size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys(new Slice[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
     keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
   }
-  std::vector<std::string> values(num_keys);
-  std::vector<Status> statuses =
-      txn_db->rep->MultiGet(options->rep, keys, &values);
+  // Use PinnableSlice to avoid unnecessary allocations
+  auto cfh = txn_db->rep->DefaultColumnFamily();
+  std::vector<PinnableSlice> values(num_keys);
+  std::vector<Status> statuses(num_keys);
+  txn_db->rep->MultiGet(options->rep, cfh, num_keys, keys.get(), values.data(),
+                        statuses.data());
   for (size_t i = 0; i < num_keys; i++) {
     if (statuses[i].ok()) {
       values_list[i] = CopyString(values[i]);
@@ -7111,15 +7426,18 @@ void rocksdb_transactiondb_multi_get_cf(
     size_t num_keys, const char* const* keys_list,
     const size_t* keys_list_sizes, char** values_list,
     size_t* values_list_sizes, char** errs) {
-  std::vector<Slice> keys(num_keys);
-  std::vector<ColumnFamilyHandle*> cfs(num_keys);
+  // Use unique_ptr for efficiency
+  std::unique_ptr<Slice[]> keys(new Slice[num_keys]);
+  std::unique_ptr<ColumnFamilyHandle*[]> cfs(new ColumnFamilyHandle*[num_keys]);
   for (size_t i = 0; i < num_keys; i++) {
     keys[i] = Slice(keys_list[i], keys_list_sizes[i]);
     cfs[i] = column_families[i]->rep;
   }
-  std::vector<std::string> values(num_keys);
-  std::vector<Status> statuses =
-      txn_db->rep->MultiGet(options->rep, cfs, keys, &values);
+  // Use PinnableSlice to avoid unnecessary allocations
+  std::vector<PinnableSlice> values(num_keys);
+  std::vector<Status> statuses(num_keys);
+  txn_db->rep->MultiGet(options->rep, num_keys, cfs.get(), keys.get(),
+                        values.data(), statuses.data());
   for (size_t i = 0; i < num_keys; i++) {
     if (statuses[i].ok()) {
       values_list[i] = CopyString(values[i]);
@@ -7710,6 +8028,112 @@ void rocksdb_wait_for_compact_options_set_timeout(
 uint64_t rocksdb_wait_for_compact_options_get_timeout(
     rocksdb_wait_for_compact_options_t* opt) {
   return opt->rep.timeout.count();
+}
+
+/* High-performance zero-copy Get implementations */
+
+struct rocksdb_pinnable_handle_t {
+  PinnableSlice rep;
+};
+
+rocksdb_pinnable_handle_t* rocksdb_get_pinned_v2(
+    rocksdb_t* db, const rocksdb_readoptions_t* options, const char* key,
+    size_t keylen, char** errptr) {
+  rocksdb_pinnable_handle_t* handle = new rocksdb_pinnable_handle_t;
+  Status s = db->rep->Get(options->rep, db->rep->DefaultColumnFamily(),
+                          Slice(key, keylen), &handle->rep);
+  if (!s.ok()) {
+    delete handle;
+    if (!s.IsNotFound()) {
+      SaveError(errptr, s);
+    }
+    return nullptr;
+  }
+  return handle;
+}
+
+rocksdb_pinnable_handle_t* rocksdb_get_pinned_cf_v2(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, const char* key,
+    size_t keylen, char** errptr) {
+  rocksdb_pinnable_handle_t* handle = new rocksdb_pinnable_handle_t;
+  Status s = db->rep->Get(options->rep, column_family->rep, Slice(key, keylen),
+                          &handle->rep);
+  if (!s.ok()) {
+    delete handle;
+    if (!s.IsNotFound()) {
+      SaveError(errptr, s);
+    }
+    return nullptr;
+  }
+  return handle;
+}
+
+const char* rocksdb_pinnable_handle_get_value(
+    const rocksdb_pinnable_handle_t* handle, size_t* vallen) {
+  if (!handle) {
+    *vallen = 0;
+    return nullptr;
+  }
+  *vallen = handle->rep.size();
+  return handle->rep.data();
+}
+
+void rocksdb_pinnable_handle_destroy(rocksdb_pinnable_handle_t* handle) {
+  delete handle;
+}
+
+unsigned char rocksdb_get_into_buffer(rocksdb_t* db,
+                                      const rocksdb_readoptions_t* options,
+                                      const char* key, size_t keylen,
+                                      char* buffer, size_t buffer_size,
+                                      size_t* vallen, unsigned char* found,
+                                      char** errptr) {
+  PinnableSlice pinnable_val;
+  Status s = db->rep->Get(options->rep, db->rep->DefaultColumnFamily(),
+                          Slice(key, keylen), &pinnable_val);
+  if (s.ok()) {
+    *found = 1;
+    *vallen = pinnable_val.size();
+    if (buffer_size >= pinnable_val.size()) {
+      memcpy(buffer, pinnable_val.data(), pinnable_val.size());
+      return 1;  // Success - data copied
+    }
+    return 0;  // Buffer too small
+  } else {
+    *found = 0;
+    *vallen = 0;
+    if (!s.IsNotFound()) {
+      SaveError(errptr, s);
+    }
+    return 0;
+  }
+}
+
+unsigned char rocksdb_get_into_buffer_cf(
+    rocksdb_t* db, const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* column_family, const char* key,
+    size_t keylen, char* buffer, size_t buffer_size, size_t* vallen,
+    unsigned char* found, char** errptr) {
+  PinnableSlice pinnable_val;
+  Status s = db->rep->Get(options->rep, column_family->rep, Slice(key, keylen),
+                          &pinnable_val);
+  if (s.ok()) {
+    *found = 1;
+    *vallen = pinnable_val.size();
+    if (buffer_size >= pinnable_val.size()) {
+      memcpy(buffer, pinnable_val.data(), pinnable_val.size());
+      return 1;  // Success - data copied
+    }
+    return 0;  // Buffer too small
+  } else {
+    *found = 0;
+    *vallen = 0;
+    if (!s.IsNotFound()) {
+      SaveError(errptr, s);
+    }
+    return 0;
+  }
 }
 
 }  // end extern "C"

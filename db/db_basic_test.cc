@@ -675,30 +675,6 @@ TEST_F(DBBasicTest, Flush) {
   } while (ChangeCompactOptions());
 }
 
-TEST_F(DBBasicTest, ManifestRollOver) {
-  do {
-    Options options;
-    options.max_manifest_file_size = 10;  // 10 bytes
-    options = CurrentOptions(options);
-    CreateAndReopenWithCF({"pikachu"}, options);
-    {
-      ASSERT_OK(Put(1, "manifest_key1", std::string(1000, '1')));
-      ASSERT_OK(Put(1, "manifest_key2", std::string(1000, '2')));
-      ASSERT_OK(Put(1, "manifest_key3", std::string(1000, '3')));
-      uint64_t manifest_before_flush = dbfull()->TEST_Current_Manifest_FileNo();
-      ASSERT_OK(Flush(1));  // This should trigger LogAndApply.
-      uint64_t manifest_after_flush = dbfull()->TEST_Current_Manifest_FileNo();
-      ASSERT_GT(manifest_after_flush, manifest_before_flush);
-      ReopenWithColumnFamilies({"default", "pikachu"}, options);
-      ASSERT_GT(dbfull()->TEST_Current_Manifest_FileNo(), manifest_after_flush);
-      // check if a new manifest file got inserted or not.
-      ASSERT_EQ(std::string(1000, '1'), Get(1, "manifest_key1"));
-      ASSERT_EQ(std::string(1000, '2'), Get(1, "manifest_key2"));
-      ASSERT_EQ(std::string(1000, '3'), Get(1, "manifest_key3"));
-    }
-  } while (ChangeCompactOptions());
-}
-
 TEST_F(DBBasicTest, IdentityAcrossRestarts) {
   constexpr size_t kMinIdSize = 10;
   do {
@@ -5087,6 +5063,7 @@ TEST_F(DBBasicTest, DisallowMemtableWrite) {
   Options options_disallow = options_allow;
   options_disallow.disallow_memtable_writes = true;
   options_disallow.paranoid_memory_checks = true;
+  options_disallow.memtable_veirfy_per_key_checksum_on_seek = true;
 
   DestroyAndReopen(options_allow);
   // CFs allowing and disallowing memtable write
