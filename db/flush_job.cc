@@ -447,7 +447,13 @@ Status FlushJob::MemPurge() {
   // Place iterator at the First (meaning most recent) key node.
   iter->SeekToFirst();
 
-  const std::string* const full_history_ts_low = &(cfd_->GetFullHistoryTsLow());
+  // When full_history_ts_low is an empty string, pass nullptr instead of a
+  // pointer to the empty string. MergeHelper assumes a non-null pointer means
+  // timestamps are enabled and asserts ts_sz > 0, which fails when the
+  // comparator has no timestamp support.
+  const auto& full_history_ts_low_ref = cfd_->GetFullHistoryTsLow();
+  const std::string* const full_history_ts_low =
+      full_history_ts_low_ref.empty() ? nullptr : &full_history_ts_low_ref;
   std::unique_ptr<CompactionRangeDelAggregator> range_del_agg(
       new CompactionRangeDelAggregator(&(cfd_->internal_comparator()),
                                        job_context_->snapshot_seqs,
