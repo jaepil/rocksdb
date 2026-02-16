@@ -987,11 +987,8 @@ Status DBImplSecondary::ParseCompactionProgressFile(
   Slice slice;
   std::string record;
 
-  while (compaction_progress_reader.ReadRecord(&slice, &record)) {
-    if (!reader_status.ok()) {
-      return reader_status;
-    }
-
+  while (compaction_progress_reader.ReadRecord(&slice, &record) &&
+         reader_status.ok()) {
     VersionEdit edit;
     s = edit.DecodeFrom(slice);
     if (!s.ok()) {
@@ -1002,6 +999,10 @@ Status DBImplSecondary::ParseCompactionProgressFile(
     if (!res) {
       break;
     }
+  }
+
+  if (!reader_status.ok()) {
+    return reader_status;
   }
 
   if (!s.ok()) {
@@ -1101,11 +1102,6 @@ Status DBImplSecondary::InitializeCompactionWorkspace(
   if (!s.ok()) {
     return s;
   }
-
-  ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                 "Initialized compaction workspace with %zu subcompaction "
-                 "progress to resume",
-                 compaction_progress_.size());
 
   return Status::OK();
 }
@@ -1219,6 +1215,11 @@ Status DBImplSecondary::PrepareCompactionProgressState() {
       return HandleInvalidOrNoCompactionProgress(compaction_progress_file_path,
                                                  scan_result);
     }
+
+    ROCKS_LOG_DEBUG(
+        immutable_db_options_.info_log,
+        "Loaded compaction progress with %zu subcompaction(s) from %s",
+        compaction_progress_.size(), compaction_progress_file_path.c_str());
     return s;
   } else {
     return HandleInvalidOrNoCompactionProgress(
@@ -1740,6 +1741,11 @@ Status DBImplSecondary::FinalizeCompactionProgressWriter(
     return HandleCompactionProgressWriterCreationFailure(
         "" /* temp_file_path */, final_file_path, compaction_progress_writer);
   }
+
+  ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
+                  "Finalized compaction progress writer onto %s",
+                  final_file_path.c_str());
+
   return Status::OK();
 }
 }  // namespace ROCKSDB_NAMESPACE

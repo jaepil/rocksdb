@@ -576,9 +576,8 @@ Status GetDecompressor(const std::string& compression_name,
                        std::shared_ptr<Decompressor>* out_decompressor) {
   if (compression_name.empty()) {
     // Very old file (before RocksDB 4.9.0) that might contain compressed
-    // blocks. Get a general decompressor for the format version.
-    auto mgr_to_use = GetBuiltinCompressionManager(
-        GetCompressFormatForVersion(table_format_version));
+    // blocks. Get a general decompressor (for all supported format_versions)
+    auto mgr_to_use = GetBuiltinV2CompressionManager();
     *out_decompressor = mgr_to_use->GetDecompressor();
     return Status::OK();
   }
@@ -664,8 +663,7 @@ Status GetDecompressor(const std::string& compression_name,
                                 compression_name);
     } else if (saved_comp_type != kNoCompression) {
       // Use built-in compression manager
-      auto mgr_to_use = GetBuiltinCompressionManager(
-          GetCompressFormatForVersion(table_format_version));
+      auto mgr_to_use = GetBuiltinV2CompressionManager();
       *out_decompressor =
           mgr_to_use->GetDecompressorOptimizeFor(saved_comp_type);
     } else {
@@ -810,7 +808,8 @@ Status BlockBasedTable::Open(
     }
     return s;
   }
-  if (!IsSupportedFormatVersion(footer.format_version()) &&
+  if (!IsSupportedFormatVersionForRead(kBlockBasedTableMagicNumber,
+                                       footer.format_version()) &&
       !TEST_AllowUnsupportedFormatVersion()) {
     return Status::Corruption(
         "Unknown Footer version. Maybe this file was created with newer "
@@ -823,13 +822,6 @@ Status BlockBasedTable::Open(
       file_size, level, immortal_table, user_defined_timestamps_persisted);
   rep->file = std::move(file);
   rep->footer = footer;
-
-  // Some ancient versions (~2.5 - 2.7, format_version=1) could compress the
-  // metaindex block, so we need to allow for that
-  if (footer.format_version() < 2) {
-    auto mgr = GetBuiltinCompressionManager(/*compression_format_version=*/1);
-    rep->decompressor = mgr->GetDecompressor();
-  }
 
   // For fully portable/stable cache keys, we need to read the properties
   // block before setting up cache keys. TODO: consider setting up a bootstrap
@@ -1706,7 +1698,8 @@ IndexBlockIter* BlockBasedTable::InitBlockIterator<IndexBlockIter>(
       rep->get_global_seqno(block_type), input_iter, rep->ioptions.stats,
       /* total_order_seek */ true, rep->index_has_first_key,
       rep->index_key_includes_seq, rep->index_value_is_full,
-      block_contents_pinned, rep->user_defined_timestamps_persisted);
+      block_contents_pinned, rep->user_defined_timestamps_persisted,
+      nullptr /* prefix_index */, rep->table_options.index_block_search_type);
 }
 
 // Right now only called for Data blocks.
@@ -3232,13 +3225,25 @@ Status BlockBasedTable::GetKVPairsFromDataBlocks(
   return Status::OK();
 }
 
-Status BlockBasedTable::DumpTable(WritableFile* out_file) {
+Status BlockBasedTable::DumpTable(WritableFile* out_file,
+                                  bool show_sequence_number_type) {
   WritableFileStringStreamAdapter out_file_wrapper(out_file);
   std::ostream out_stream(&out_file_wrapper);
   // Output Footer
   out_stream << "Footer Details:\n"
                 "--------------------------------------\n";
   out_stream << "  " << rep_->footer.ToString() << "\n";
+
+  // Output Checksum Type Legend
+  out_stream << "Block Checksum Type Legend:\n"
+                "--------------------------------------\n";
+  out_stream << "  0 = kNoChecksum\n";
+  out_stream << "  1 = kCRC32c\n";
+  out_stream << "  2 = kxxHash\n";
+  out_stream << "  3 = kxxHash64\n";
+  out_stream << "  4 = kXXH3\n";
+  out_stream << "  (This file uses checksum type: "
+             << static_cast<int>(rep_->footer.checksum_type()) << ")\n\n";
 
   // Output MetaIndex
   out_stream << "Metaindex Details:\n"
@@ -3250,25 +3255,47 @@ Status BlockBasedTable::DumpTable(WritableFile* out_file) {
   Status s = ReadMetaIndexBlock(ro, nullptr /* prefetch_buffer */, &metaindex,
                                 &metaindex_iter);
   if (s.ok()) {
+    // Print metaindex block checksum
+    DumpBlockChecksumInfo(rep_->footer.metaindex_handle(), ro,
+                          "Metaindex block", out_stream);
+
     for (metaindex_iter->SeekToFirst(); metaindex_iter->Valid();
          metaindex_iter->Next()) {
       s = metaindex_iter->status();
       if (!s.ok()) {
         return s;
       }
+      // Parse block handle from metaindex value
+      BlockHandle block_handle;
+      Slice input = metaindex_iter->value();
+      Status handle_status = block_handle.DecodeFrom(&input);
+
+      if (!handle_status.ok()) {
+        out_stream << "  Skip the block with type "
+                   << metaindex_iter->key().ToString()
+                   << " due to error: " << handle_status.ToString() << "\n\n";
+        continue;
+      }
+
       if (metaindex_iter->key() == kPropertiesBlockName) {
         out_stream << "  Properties block handle: "
                    << metaindex_iter->value().ToString(true) << "\n";
+        DumpBlockChecksumInfo(block_handle, ro, "Properties block", out_stream);
       } else if (metaindex_iter->key() == kCompressionDictBlockName) {
         out_stream << "  Compression dictionary block handle: "
                    << metaindex_iter->value().ToString(true) << "\n";
+        DumpBlockChecksumInfo(block_handle, ro, "Compression dictionary block",
+                              out_stream);
       } else if (strstr(metaindex_iter->key().ToString().c_str(),
                         "filter.rocksdb.") != nullptr) {
         out_stream << "  Filter block handle: "
                    << metaindex_iter->value().ToString(true) << "\n";
+        DumpBlockChecksumInfo(block_handle, ro, "Filter block", out_stream);
       } else if (metaindex_iter->key() == kRangeDelBlockName) {
         out_stream << "  Range deletion block handle: "
                    << metaindex_iter->value().ToString(true) << "\n";
+        DumpBlockChecksumInfo(block_handle, ro, "Range deletion block",
+                              out_stream);
       }
     }
     out_stream << "\n";
@@ -3325,15 +3352,15 @@ Status BlockBasedTable::DumpTable(WritableFile* out_file) {
       out_stream << "Range deletions:\n"
                     "--------------------------------------\n";
       for (; range_del_iter->Valid(); range_del_iter->Next()) {
-        DumpKeyValue(range_del_iter->key(), range_del_iter->value(),
-                     out_stream);
+        DumpKeyValue(range_del_iter->key(), range_del_iter->value(), out_stream,
+                     show_sequence_number_type);
       }
       out_stream << "\n";
     }
     delete range_del_iter;
   }
   // Output Data blocks
-  s = DumpDataBlocks(out_stream);
+  s = DumpDataBlocks(out_stream, show_sequence_number_type);
 
   if (!s.ok()) {
     return s;
@@ -3345,11 +3372,61 @@ Status BlockBasedTable::DumpTable(WritableFile* out_file) {
   return Status::OK();
 }
 
+void BlockBasedTable::DumpBlockChecksumInfo(const BlockHandle& block_handle,
+                                            const ReadOptions& read_options,
+                                            const char* block_name,
+                                            std::ostream& out_stream) const {
+  if (rep_->footer.GetBlockTrailerSize() == 0) {
+    return;
+  }
+
+  size_t block_size = static_cast<size_t>(block_handle.size());
+  size_t block_size_with_trailer = block_size + kBlockTrailerSize;
+  std::unique_ptr<char[]> raw_block(new char[block_size_with_trailer]);
+  Slice raw_block_slice;
+  IOOptions opts;
+  IODebugContext dbg;
+  IOStatus io_s = rep_->file->PrepareIOOptions(read_options, opts, &dbg);
+  if (io_s.ok()) {
+    io_s = rep_->file->Read(opts, block_handle.offset(),
+                            block_size_with_trailer, &raw_block_slice,
+                            raw_block.get(), /*aligned_buf=*/nullptr, &dbg);
+  }
+  if (io_s.ok() && raw_block_slice.size() == block_size_with_trailer) {
+    const char* data = raw_block_slice.data();
+    uint8_t compression_type_byte = static_cast<uint8_t>(data[block_size]);
+    uint32_t stored_checksum = DecodeFixed32(data + block_size + 1);
+    uint32_t modifier = ChecksumModifierForContext(
+        rep_->footer.base_context_checksum(), block_handle.offset());
+    uint32_t actual_checksum = stored_checksum - modifier;
+    out_stream << "  " << block_name << " checksum type: "
+               << static_cast<int>(rep_->footer.checksum_type())
+               << "  checksum value: 0x" << std::hex << actual_checksum
+               << std::dec << "  offset: " << block_handle.offset()
+               << "  size: " << block_size << "  compression type: "
+               << static_cast<int>(compression_type_byte) << "\n";
+  } else {
+    out_stream << "  ERROR: Failed to read " << block_name << " checksum info";
+    if (!io_s.ok()) {
+      out_stream << " - " << io_s.ToString();
+    } else if (raw_block_slice.size() != block_size_with_trailer) {
+      out_stream << " - read " << raw_block_slice.size() << " bytes, expected "
+                 << block_size_with_trailer;
+    }
+    out_stream << "\n";
+  }
+}
+
 Status BlockBasedTable::DumpIndexBlock(std::ostream& out_stream) {
   out_stream << "Index Details:\n"
                 "--------------------------------------\n";
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
+
+  // Print index block checksum information
+  DumpBlockChecksumInfo(rep_->index_handle, read_options, "Index block",
+                        out_stream);
+
   std::unique_ptr<InternalIteratorBase<IndexValue>> blockhandles_iter(
       NewIndexIterator(read_options, /*disable_prefix_seek=*/false,
                        /*input_iter=*/nullptr, /*get_context=*/nullptr,
@@ -3398,7 +3475,8 @@ Status BlockBasedTable::DumpIndexBlock(std::ostream& out_stream) {
   return Status::OK();
 }
 
-Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
+Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream,
+                                       bool show_sequence_number_type) {
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
   std::unique_ptr<InternalIteratorBase<IndexValue>> blockhandles_iter(
@@ -3431,6 +3509,10 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
 
     out_stream << "Data Block # " << block_id << " @ "
                << blockhandles_iter->value().handle.ToString(true) << "\n";
+
+    // Read block checksum information
+    DumpBlockChecksumInfo(bh, read_options, "Data block", out_stream);
+
     out_stream << "--------------------------------------\n";
 
     std::unique_ptr<InternalIterator> datablock_iter;
@@ -3455,7 +3537,8 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
         out_stream << "Error reading the block - Skipped \n";
         break;
       }
-      DumpKeyValue(datablock_iter->key(), datablock_iter->value(), out_stream);
+      DumpKeyValue(datablock_iter->key(), datablock_iter->value(), out_stream,
+                   show_sequence_number_type);
     }
     out_stream << "\n";
   }
@@ -3477,14 +3560,26 @@ Status BlockBasedTable::DumpDataBlocks(std::ostream& out_stream) {
 }
 
 void BlockBasedTable::DumpKeyValue(const Slice& key, const Slice& value,
-                                   std::ostream& out_stream) {
-  InternalKey ikey;
-  ikey.DecodeFrom(key);
+                                   std::ostream& out_stream,
+                                   bool show_sequence_number_type) {
+  ParsedInternalKey result;
+  auto s = ParseInternalKey(key, &result, true);
+  if (!s.ok()) {
+    out_stream << "Error parsing internal key - Skipped \n";
+    return;
+  }
 
-  out_stream << "  HEX    " << ikey.user_key().ToString(true) << ": "
-             << value.ToString(true) << "\n";
+  if (show_sequence_number_type) {
+    out_stream << "  HEX    " << result.user_key.ToString(true)
+               << "  seq: " << result.sequence
+               << "  type: " << std::to_string(result.type) << " : "
+               << value.ToString(true) << "\n";
+  } else {
+    out_stream << "  HEX    " << result.user_key.ToString(true) << ": "
+               << value.ToString(true) << "\n";
+  }
 
-  std::string str_key = ikey.user_key().ToString();
+  std::string str_key = result.user_key.ToString();
   std::string str_value = value.ToString();
   std::string res_key, res_value;
   char cspace = ' ';

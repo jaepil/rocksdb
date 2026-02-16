@@ -98,7 +98,7 @@ endif  # FMT_SOURCE_PATH
 	PLATFORM_LDFLAGS += -lglog
 endif
 
-FOLLY_COMMIT_HASH = abe68f7e917e8b7a0ee2fe066c972dc98fd35aa1
+FOLLY_COMMIT_HASH = d2d1e6f746faa9ae7a973381dbd017634d04a040
 
 # For public CI runs, checkout folly in a way that can build with RocksDB.
 # This is mostly intended as a test-only simulation of Meta-internal folly
@@ -116,10 +116,27 @@ checkout_folly:
 	perl -pi -e 's/(#include <atomic>)/$$1\n#include <cstring>/' third-party/folly/folly/lang/Exception.h
 	@# const mismatch
 	perl -pi -e 's/: environ/: (const char**)(environ)/' third-party/folly/folly/Subprocess.cpp
-	@# Use gnu.org mirrors to improve download speed (ftp.gnu.org is often super slow)
-	cd third-party/folly && perl -pi -e 's/ftp.gnu.org/ftpmirror.gnu.org/' `git grep -l ftp.gnu.org` README.md
+	@# Restore cached downloads and handle unreliable mirrors with fallback
+	@cd third-party/folly && \
+		DOWNLOAD_DIR=`$(PYTHON) build/fbcode_builder/getdeps.py show-inst-dir | sed 's|/installed/.*|/downloads|'` && \
+		mkdir -p "$$DOWNLOAD_DIR" && \
+		CACHE_DIR="/tmp/rocksdb-getdeps-cache" && \
+		mkdir -p "$$CACHE_DIR" && \
+		echo "Restoring cached downloads..." && \
+		if ls "$$CACHE_DIR"/*.tar.gz "$$CACHE_DIR"/*.tar.xz "$$CACHE_DIR"/*.zip >/dev/null 2>&1; then \
+			cp -n "$$CACHE_DIR"/*.tar.gz "$$CACHE_DIR"/*.tar.xz "$$CACHE_DIR"/*.zip "$$DOWNLOAD_DIR/" 2>/dev/null || true; \
+		fi && \
+		echo "Handling known unreliable downloads with fallback mirrors..." && \
+		$(PYTHON) ../../build_tools/getdeps_fallback_mirror.py "$$DOWNLOAD_DIR" "$$CACHE_DIR" build/fbcode_builder/manifests
 	@# NOTE: boost and fmt source will be needed for any build including `USE_FOLLY_LITE` builds as those depend on those headers
 	cd third-party/folly && GETDEPS_USE_WGET=1 $(PYTHON) build/fbcode_builder/getdeps.py fetch boost && GETDEPS_USE_WGET=1 $(PYTHON) build/fbcode_builder/getdeps.py fetch fmt
+	@# Update cache with any new downloads
+	@cd third-party/folly && \
+		DOWNLOAD_DIR=`$(PYTHON) build/fbcode_builder/getdeps.py show-inst-dir | sed 's|/installed/.*|/downloads|'` && \
+		CACHE_DIR="/tmp/rocksdb-getdeps-cache" && \
+		if ls "$$DOWNLOAD_DIR"/*.tar.gz "$$DOWNLOAD_DIR"/*.tar.xz "$$DOWNLOAD_DIR"/*.zip >/dev/null 2>&1; then \
+			cp -n "$$DOWNLOAD_DIR"/*.tar.gz "$$DOWNLOAD_DIR"/*.tar.xz "$$DOWNLOAD_DIR"/*.zip "$$CACHE_DIR/" 2>/dev/null || true; \
+		fi
 
 CXX_M_FLAGS = $(filter -m%, $(CXXFLAGS))
 

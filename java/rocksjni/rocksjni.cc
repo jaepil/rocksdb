@@ -67,11 +67,11 @@ jlong rocksdb_open_helper(JNIEnv* env, jlong jopt_handle, jstring jdb_path,
 jlong Java_org_rocksdb_RocksDB_open__JLjava_lang_String_2(JNIEnv* env, jclass,
                                                           jlong jopt_handle,
                                                           jstring jdb_path) {
-  return rocksdb_open_helper(env, jopt_handle, jdb_path,
-                             (ROCKSDB_NAMESPACE::Status(*)(
-                                 const ROCKSDB_NAMESPACE::Options&,
-                                 const std::string&, ROCKSDB_NAMESPACE::DB**)) &
-                                 ROCKSDB_NAMESPACE::DB::Open);
+  return rocksdb_open_helper(
+      env, jopt_handle, jdb_path,
+      (ROCKSDB_NAMESPACE::Status (*)(
+          const ROCKSDB_NAMESPACE::Options&, const std::string&,
+          ROCKSDB_NAMESPACE::DB**))&ROCKSDB_NAMESPACE::DB::Open);
 }
 
 /*
@@ -213,12 +213,11 @@ jlongArray Java_org_rocksdb_RocksDB_open__JLjava_lang_String_2_3_3B_3J(
     jobjectArray jcolumn_names, jlongArray jcolumn_options) {
   return rocksdb_open_helper(
       env, jopt_handle, jdb_path, jcolumn_names, jcolumn_options,
-      (ROCKSDB_NAMESPACE::Status(*)(
+      (ROCKSDB_NAMESPACE::Status (*)(
           const ROCKSDB_NAMESPACE::DBOptions&, const std::string&,
           const std::vector<ROCKSDB_NAMESPACE::ColumnFamilyDescriptor>&,
           std::vector<ROCKSDB_NAMESPACE::ColumnFamilyHandle*>*,
-          ROCKSDB_NAMESPACE::DB**)) &
-          ROCKSDB_NAMESPACE::DB::Open);
+          ROCKSDB_NAMESPACE::DB**))&ROCKSDB_NAMESPACE::DB::Open);
 }
 
 /*
@@ -2976,6 +2975,28 @@ void Java_org_rocksdb_RocksDB_continueBackgroundWork(JNIEnv* env, jclass,
   if (!s.ok()) {
     ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
   }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
+ * Method:    abortAllCompactions
+ * Signature: (J)V
+ */
+void Java_org_rocksdb_RocksDB_abortAllCompactions(JNIEnv*, jclass,
+                                                  jlong jdb_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  db->AbortAllCompactions();
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
+ * Method:    resumeAllCompactions
+ * Signature: (J)V
+ */
+void Java_org_rocksdb_RocksDB_resumeAllCompactions(JNIEnv*, jclass,
+                                                   jlong jdb_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  db->ResumeAllCompactions();
 }
 
 /*

@@ -375,6 +375,8 @@ class StackableDB : public DB {
   void DisableManualCompaction() override {
     return db_->DisableManualCompaction();
   }
+  void AbortAllCompactions() override { return db_->AbortAllCompactions(); }
+  void ResumeAllCompactions() override { return db_->ResumeAllCompactions(); }
 
   Status WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options) override {
@@ -549,10 +551,11 @@ class StackableDB : public DB {
   }
 
   using DB::SetOptions;
-  Status SetOptions(ColumnFamilyHandle* column_family_handle,
-                    const std::unordered_map<std::string, std::string>&
-                        new_options) override {
-    return db_->SetOptions(column_family_handle, new_options);
+  Status SetOptions(
+      const std::unordered_map<ColumnFamilyHandle*,
+                               std::unordered_map<std::string, std::string>>&
+          column_families_opts_map) override {
+    return db_->SetOptions(column_families_opts_map);
   }
 
   Status SetDBOptions(const std::unordered_map<std::string, std::string>&

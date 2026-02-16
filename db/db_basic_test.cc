@@ -242,6 +242,43 @@ TEST_F(DBBasicTest, ReadOnlyDB) {
             Status::Code::kNotSupported);
 }
 
+TEST_F(DBBasicTest, ReadOnlyDBFlushWAL) {
+  // Test that FlushWAL returns NotSupported on read-only DB, and that
+  // GetLiveFilesStorageInfo works correctly even with manual_wal_flush=true.
+  // This is a regression test for a bug where GetLiveFilesStorageInfo would
+  // crash on read-only DBs with manual_wal_flush=true because FlushWAL
+  // accessed logs_.back() on an empty deque.
+  auto options = CurrentOptions();
+  options.manual_wal_flush = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Put("bar", "v2"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("baz", "v3"));  // Unflushed data in WAL
+  Close();
+
+  // Reopen as read-only
+  ASSERT_OK(ReadOnlyReopen(options));
+  ASSERT_EQ("v1", Get("foo"));
+  ASSERT_EQ("v2", Get("bar"));
+  ASSERT_EQ("v3", Get("baz"));
+
+  // FlushWAL should return NotSupported (not crash)
+  ASSERT_EQ(db_->FlushWAL(/*sync=*/false).code(), Status::Code::kNotSupported);
+  ASSERT_EQ(db_->FlushWAL(/*sync=*/true).code(), Status::Code::kNotSupported);
+
+  // GetLiveFilesStorageInfo should succeed (previously crashed with
+  // manual_wal_flush=true because it called FlushWAL which accessed
+  // logs_.back() on empty deque)
+  LiveFilesStorageInfoOptions lfsi_opts;
+  lfsi_opts.wal_size_for_flush = 0;
+  std::vector<LiveFileStorageInfo> files;
+  ASSERT_OK(db_->GetLiveFilesStorageInfo(lfsi_opts, &files));
+  ASSERT_GT(files.size(), 0);
+
+  Close();
+}
+
 TEST_F(DBBasicTest, ReadOnlyDBWithWriteDBIdToManifestSet) {
   auto options = CurrentOptions();
   options.write_dbid_to_manifest = false;
@@ -3866,6 +3903,75 @@ TEST_F(DBBasicTest, SkipWALIfMissingTableFiles) {
   iter->Next();
   ASSERT_FALSE(iter->Valid());
   ASSERT_OK(iter->status());
+}
+
+TEST_F(DBBasicTest, BestEffortRecoveryFailureWithTableCacheUseAfterFree) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.env = env_;
+  // Force multiple manifest files
+  options.max_manifest_file_size = 1;
+  options.max_manifest_space_amp_pct = 0;
+
+  DestroyAndReopen(options);
+
+  // Disable file deletions to preserve old manifest files for
+  // best-efforts recovery to succeed
+  ASSERT_OK(db_->DisableFileDeletions());
+
+  // Create multiple SST files to populate TableCache during
+  // best-efforts recovery
+  for (int i = 0; i < 10; i++) {
+    ASSERT_OK(Put("key" + std::to_string(i),
+                  std::string(1000, static_cast<char>('a' + i))));
+    ASSERT_OK(Flush());
+  }
+
+  // Verify we have multiple manifest files
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  int manifest_count = 0;
+  for (const auto& file : files) {
+    if (file.find("MANIFEST") != std::string::npos) {
+      manifest_count++;
+    }
+  }
+  ASSERT_GE(manifest_count, 2);
+
+  // Inject corruption after TableCache is populated (count > 3), but only once
+  // (injected flag) to allow best-effort recovery to trigger retry and succeed.
+  // This coerce the bug: first recovery caches SSTs with reference to column
+  // family's options in table cache and retry deletes column family so the
+  // reference becomes dangling.
+  int count = 0;
+  bool injected = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "VersionBuilder::CheckConsistencyBeforeReturn", [&](void* arg) {
+        count++;
+        if (count > 3 && !injected) {
+          ASSERT_NE(nullptr, arg);
+          *(static_cast<Status*>(arg)) =
+              Status::Corruption("Injected corruption");
+          injected = true;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  options.best_efforts_recovery = true;
+
+  Status s = TryReopen(options);
+  ASSERT_OK(s);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  for (int i = 0; i < 10; i++) {
+    std::string value;
+    // Without the fix, ASAN detects use-after-free when accessing cached SST
+    // files that hold dangling references to deleted ioptions.
+    s = db_->Get(ReadOptions(), "key" + std::to_string(i), &value);
+    ASSERT_TRUE(s.ok() || s.IsNotFound());
+  }
 }
 
 TEST_F(DBBasicTest, DisableTrackWal) {

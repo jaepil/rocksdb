@@ -3691,6 +3691,8 @@ class ModelDB : public DB {
   void EnableManualCompaction() override {}
 
   void DisableManualCompaction() override {}
+  void AbortAllCompactions() override {}
+  void ResumeAllCompactions() override {}
 
   Status WaitForCompact(
       const WaitForCompactOptions& /* wait_for_compact_options */) override {
@@ -6182,72 +6184,6 @@ TEST_F(DBTest, L0L1L2AndUpHitCounter) {
                                TestGetTickerCount(options, GET_HIT_L2_AND_UP));
 }
 
-TEST_F(DBTest, EncodeDecompressedBlockSizeTest) {
-  // Allow testing format_version=1
-  bool& allow_unsupported_fv = TEST_AllowUnsupportedFormatVersion();
-  SaveAndRestore guard(&allow_unsupported_fv);
-  ASSERT_FALSE(allow_unsupported_fv);
-
-  // iter 0 -- zlib
-  // iter 1 -- bzip2
-  // iter 2 -- lz4
-  // iter 3 -- lz4HC
-  // iter 4 -- xpress
-  CompressionType compressions[] = {kZlibCompression, kBZip2Compression,
-                                    kLZ4Compression, kLZ4HCCompression,
-                                    kXpressCompression};
-  for (auto comp : compressions) {
-    if (!CompressionTypeSupported(comp)) {
-      continue;
-    }
-    // first_table_version 1 -- generate with table_version == 1, read with
-    // table_version == 2
-    // first_table_version 2 -- generate with table_version == 2, read with
-    // table_version == 1
-    for (int first_table_version = 1; first_table_version <= 2;
-         ++first_table_version) {
-      BlockBasedTableOptions table_options;
-      table_options.format_version = first_table_version;
-      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
-      Options options = CurrentOptions();
-
-      // Hack to generate old files (checked in factory construction)
-      allow_unsupported_fv = true;
-      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-      ASSERT_EQ(options.table_factory->GetOptions<BlockBasedTableOptions>()
-                    ->format_version,
-                first_table_version);
-      // Able to read old files without the hack
-      allow_unsupported_fv = false;
-
-      options.create_if_missing = true;
-      options.compression = comp;
-      DestroyAndReopen(options);
-
-      int kNumKeysWritten = 1000;
-
-      Random rnd(301);
-      for (int i = 0; i < kNumKeysWritten; ++i) {
-        // compressible string
-        ASSERT_OK(Put(Key(i), rnd.RandomString(128) + std::string(128, 'a')));
-      }
-      ASSERT_OK(Flush());
-
-      table_options.format_version = first_table_version == 1 ? 2 : 1;
-      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-      // format_version (for writing) is sanitized to minimum supported
-      ASSERT_EQ(options.table_factory->GetOptions<BlockBasedTableOptions>()
-                    ->format_version,
-                BlockBasedTableFactory::kMinSupportedFormatVersion);
-      Reopen(options);
-      for (int i = 0; i < kNumKeysWritten; ++i) {
-        auto r = Get(Key(i));
-        ASSERT_EQ(r.substr(128), std::string(128, 'a'));
-      }
-    }
-  }
-}
-
 TEST_F(DBTest, CloseSpeedup) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleLevel;
@@ -6484,7 +6420,8 @@ TEST_P(DBTestWithParam, CompactionTotalTimeTest) {
   ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
 
   // Hard-coded number in CompactionJob::ProcessKeyValueCompaction().
-  const int kRecordStatsEvery = 1000;
+  // Uses 1024 (power of 2) for efficient bitwise check.
+  const int kRecordStatsEvery = 1024;
   // The stat COMPACTION_CPU_TOTAL_TIME should be recorded
   // during compaction and once more after compaction.
   ASSERT_EQ(n / kRecordStatsEvery + 1, record_count);

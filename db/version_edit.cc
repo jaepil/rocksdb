@@ -30,7 +30,6 @@ uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
 Status FileMetaData::UpdateBoundaries(const Slice& key, const Slice& value,
                                       SequenceNumber seqno,
                                       ValueType value_type) {
-  assert(value_type < kTypeMaxValid);
   if (value_type == kTypeBlobIndex) {
     BlobIndex blob_index;
     const Status s = blob_index.DecodeFrom(value);
@@ -305,6 +304,15 @@ void VersionEdit::EncodeToNewFile4(const FileMetaData& f, int level,
     char p = static_cast<char>(0);
     PutLengthPrefixedSlice(dst, Slice(&p, 1));
   }
+  // Encode min/max timestamp if they are non-empty
+  if (!f.min_timestamp.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kMinTimestamp);
+    PutLengthPrefixedSlice(dst, Slice(f.min_timestamp));
+  }
+  if (!f.max_timestamp.empty()) {
+    PutVarint32(dst, NewFileCustomTag::kMaxTimestamp);
+    PutLengthPrefixedSlice(dst, Slice(f.max_timestamp));
+  }
   TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                            dst);
 
@@ -443,6 +451,12 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input, int& max_level,
             return "user-defined timestamps persisted field wrong size";
           }
           f.user_defined_timestamps_persisted = (field[0] == 1);
+          break;
+        case kMinTimestamp:
+          f.min_timestamp = field.ToString();
+          break;
+        case kMaxTimestamp:
+          f.max_timestamp = field.ToString();
           break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
