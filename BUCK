@@ -106,6 +106,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/version_edit.cc",
         "db/version_edit_handler.cc",
         "db/version_set.cc",
+        "db/version_util.cc",
         "db/wal_edit.cc",
         "db/wal_manager.cc",
         "db/wide/wide_column_serialization.cc",
@@ -207,6 +208,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "table/block_based/hash_index_reader.cc",
         "table/block_based/index_builder.cc",
         "table/block_based/index_reader_common.cc",
+        "table/block_based/multi_scan_index_iterator.cc",
         "table/block_based/parsed_full_filter_block.cc",
         "table/block_based/partitioned_filter_block.cc",
         "table/block_based/partitioned_index_iterator.cc",
@@ -329,6 +331,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/secondary_index/simple_secondary_index.cc",
         "utilities/simulator_cache/cache_simulator.cc",
         "utilities/simulator_cache/sim_cache.cc",
+        "utilities/sorted_run_builder/sorted_run_builder.cc",
         "utilities/table_properties_collectors/compact_for_tiering_collector.cc",
         "utilities/table_properties_collectors/compact_on_deletion_collector.cc",
         "utilities/trace/file_trace_reader_writer.cc",
@@ -362,6 +365,9 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/transactions/write_prepared_txn_db.cc",
         "utilities/transactions/write_unprepared_txn.cc",
         "utilities/transactions/write_unprepared_txn_db.cc",
+        "utilities/trie_index/bitvector.cc",
+        "utilities/trie_index/louds_trie.cc",
+        "utilities/trie_index/trie_index_factory.cc",
         "utilities/ttl/db_ttl_impl.cc",
         "utilities/types_util.cc",
         "utilities/wal_filter.cc",
@@ -5137,6 +5143,12 @@ cpp_unittest_wrapper(name="faiss_ivf_index_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="fault_injection_fs_test",
+            srcs=["utilities/fault_injection_fs_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="fault_injection_test",
             srcs=["db/fault_injection_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5521,6 +5533,12 @@ cpp_unittest_wrapper(name="slice_transform_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="sorted_run_builder_test",
+            srcs=["utilities/sorted_run_builder/sorted_run_builder_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="sst_dump_test",
             srcs=["tools/sst_dump_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5619,6 +5637,18 @@ cpp_unittest_wrapper(name="trace_analyzer_test",
 
 cpp_unittest_wrapper(name="transaction_test",
             srcs=["utilities/transactions/transaction_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="trie_index_db_test",
+            srcs=["utilities/trie_index/trie_index_db_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="trie_index_test",
+            srcs=["utilities/trie_index/trie_index_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
@@ -5725,14 +5755,14 @@ cpp_unittest_wrapper(name="write_controller_test",
             extra_compiler_flags=[])
 
 
-cpp_unittest_wrapper(name="write_prepared_transaction_test",
-            srcs=["utilities/transactions/write_prepared_transaction_test.cc"],
+cpp_unittest_wrapper(name="write_prepared_transaction_seqno_test",
+            srcs=["utilities/transactions/write_prepared_transaction_seqno_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
 
-cpp_unittest_wrapper(name="write_prepared_transaction_test_seqno",
-            srcs=["utilities/transactions/write_prepared_transaction_test_seqno.cc"],
+cpp_unittest_wrapper(name="write_prepared_transaction_test",
+            srcs=["utilities/transactions/write_prepared_transaction_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

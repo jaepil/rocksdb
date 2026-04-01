@@ -21,157 +21,13 @@
 #include "port/stack_trace.h"
 #include "rocksdb/comparator.h"
 #include "table/block_based/block_prefix_index.h"
+#include "table/block_based/block_util.h"
 #include "table/block_based/data_block_footer.h"
 #include "table/format.h"
 #include "util/coding.h"
+#include "util/math.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-// Helper routine: decode the next block entry starting at "p",
-// storing the number of shared key bytes, non_shared key bytes,
-// and the length of the value in "*shared", "*non_shared", and
-// "*value_length", respectively.  Will not dereference past "limit".
-//
-// If any errors are detected, returns nullptr.  Otherwise, returns a
-// pointer to the key delta (just past the three decoded values).
-struct DecodeEntry {
-  inline const char* operator()(const char* p, const char* limit,
-                                uint32_t* shared, uint32_t* non_shared,
-                                uint32_t* value_length) {
-    // We need 2 bytes for shared and non_shared size. We also need one more
-    // byte either for value size or the actual value in case of value delta
-    // encoding.
-    assert(limit - p >= 3);
-    *shared = reinterpret_cast<const unsigned char*>(p)[0];
-    *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
-    *value_length = reinterpret_cast<const unsigned char*>(p)[2];
-    if ((*shared | *non_shared | *value_length) < 128) {
-      // Fast path: all three values are encoded in one byte each
-      p += 3;
-    } else {
-      if ((p = GetVarint32Ptr(p, limit, shared)) == nullptr) {
-        return nullptr;
-      }
-      if ((p = GetVarint32Ptr(p, limit, non_shared)) == nullptr) {
-        return nullptr;
-      }
-      if ((p = GetVarint32Ptr(p, limit, value_length)) == nullptr) {
-        return nullptr;
-      }
-    }
-
-    // Using an assert in place of "return null" since we should not pay the
-    // cost of checking for corruption on every single key decoding
-    assert(!(static_cast<uint32_t>(limit - p) < (*non_shared + *value_length)));
-    return p;
-  }
-};
-
-// Helper routine: similar to DecodeEntry but does not have assertions.
-// Instead, returns nullptr so that caller can detect and report failure.
-struct CheckAndDecodeEntry {
-  inline const char* operator()(const char* p, const char* limit,
-                                uint32_t* shared, uint32_t* non_shared,
-                                uint32_t* value_length) {
-    // We need 2 bytes for shared and non_shared size. We also need one more
-    // byte either for value size or the actual value in case of value delta
-    // encoding.
-    if (limit - p < 3) {
-      return nullptr;
-    }
-    *shared = reinterpret_cast<const unsigned char*>(p)[0];
-    *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
-    *value_length = reinterpret_cast<const unsigned char*>(p)[2];
-    if ((*shared | *non_shared | *value_length) < 128) {
-      // Fast path: all three values are encoded in one byte each
-      p += 3;
-    } else {
-      if ((p = GetVarint32Ptr(p, limit, shared)) == nullptr) {
-        return nullptr;
-      }
-      if ((p = GetVarint32Ptr(p, limit, non_shared)) == nullptr) {
-        return nullptr;
-      }
-      if ((p = GetVarint32Ptr(p, limit, value_length)) == nullptr) {
-        return nullptr;
-      }
-    }
-
-    if (static_cast<uint32_t>(limit - p) < (*non_shared + *value_length)) {
-      return nullptr;
-    }
-    return p;
-  }
-};
-
-struct DecodeKey {
-  inline const char* operator()(const char* p, const char* limit,
-                                uint32_t* shared, uint32_t* non_shared) {
-    uint32_t value_length;
-    return DecodeEntry()(p, limit, shared, non_shared, &value_length);
-  }
-};
-
-// In format_version 4, which is used by index blocks, the value size is not
-// encoded before the entry, as the value is known to be the handle with the
-// known size.
-struct DecodeKeyV4 {
-  inline const char* operator()(const char* p, const char* limit,
-                                uint32_t* shared, uint32_t* non_shared) {
-    // We need 2 bytes for shared and non_shared size. We also need one more
-    // byte either for value size or the actual value in case of value delta
-    // encoding.
-    if (limit - p < 3) {
-      return nullptr;
-    }
-    *shared = reinterpret_cast<const unsigned char*>(p)[0];
-    *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
-    if ((*shared | *non_shared) < 128) {
-      // Fast path: all three values are encoded in one byte each
-      p += 2;
-    } else {
-      if ((p = GetVarint32Ptr(p, limit, shared)) == nullptr) {
-        return nullptr;
-      }
-      if ((p = GetVarint32Ptr(p, limit, non_shared)) == nullptr) {
-        return nullptr;
-      }
-    }
-    return p;
-  }
-};
-
-struct DecodeEntryV4 {
-  inline const char* operator()(const char* p, const char* limit,
-                                uint32_t* shared, uint32_t* non_shared,
-                                uint32_t* value_length) {
-    assert(value_length);
-
-    *value_length = 0;
-    return DecodeKeyV4()(p, limit, shared, non_shared);
-  }
-};
-
-// Read first 8 bytes (starting at offset) as big-endian uint64_t, padding
-// with zeros on the right if the key is shorter. This preserves
-// lexicographic ordering. Non-user keys will also have end internal bytes
-// stripped and not counted for in the value.
-static uint64_t ReadBe64FromKey(Slice s, bool is_user_key, size_t offset) {
-  if (!is_user_key) {
-    assert(s.size() >= kNumInternalBytes);
-    s = Slice(s.data(), s.size() - kNumInternalBytes);
-  }
-  uint64_t val = 0;
-  offset = std::min(offset, s.size());
-  size_t len = std::min(s.size() - offset, size_t{8});
-  for (size_t i = 0; i < len; i++) {
-    val = (val << 8) | static_cast<uint8_t>(s.data()[offset + i]);
-  }
-  if (len > 0 && len < 8) {
-    val <<= (8 - len) * 8;  // Pad zeros on the right
-  }
-  return val;
-}
 
 void DataBlockIter::NextImpl() {
 #ifndef NDEBUG
@@ -181,28 +37,24 @@ void DataBlockIter::NextImpl() {
 #endif
   bool is_shared = false;
   ParseNextDataKey(&is_shared);
-  ++cur_entry_idx_;
 }
 
 void MetaBlockIter::NextImpl() {
   bool is_shared = false;
-  ParseNextKey<CheckAndDecodeEntry>(&is_shared);
-  ++cur_entry_idx_;
+  ParseNextKey<DecodeEntry, true>(&is_shared);
 }
 
-void IndexBlockIter::NextImpl() {
-  ParseNextIndexKey();
-  ++cur_entry_idx_;
-}
+void IndexBlockIter::NextImpl() { ParseNextIndexKey(); }
 
 void IndexBlockIter::PrevImpl() {
   assert(Valid());
   // Scan backwards to a restart point before current_
   const uint32_t original = current_;
+  const auto prev_entry_idx = cur_entry_idx_ - 1;
   while (GetRestartPoint(restart_index_) >= original) {
     if (restart_index_ == 0) {
       // No more entries
-      current_ = restarts_;
+      current_ = GetKeysEndOffset();
       restart_index_ = num_restarts_;
       return;
     }
@@ -212,17 +64,18 @@ void IndexBlockIter::PrevImpl() {
   // Loop until end of current entry hits the start of original entry
   while (ParseNextIndexKey() && NextEntryOffset() < original) {
   }
-  --cur_entry_idx_;
+  cur_entry_idx_ = prev_entry_idx;
 }
 
 void MetaBlockIter::PrevImpl() {
   assert(Valid());
   // Scan backwards to a restart point before current_
   const uint32_t original = current_;
+  const auto prev_entry_idx = cur_entry_idx_ - 1;
   while (GetRestartPoint(restart_index_) >= original) {
     if (restart_index_ == 0) {
       // No more entries
-      current_ = restarts_;
+      current_ = GetKeysEndOffset();
       restart_index_ = num_restarts_;
       return;
     }
@@ -231,19 +84,19 @@ void MetaBlockIter::PrevImpl() {
   SeekToRestartPoint(restart_index_);
   bool is_shared = false;
   // Loop until end of current entry hits the start of original entry
-  while (ParseNextKey<CheckAndDecodeEntry>(&is_shared) &&
+  while (ParseNextKey<DecodeEntry, true>(&is_shared) &&
          NextEntryOffset() < original) {
   }
-  --cur_entry_idx_;
+  cur_entry_idx_ = prev_entry_idx;
 }
 
 // Similar to IndexBlockIter::PrevImpl but also caches the prev entries
 void DataBlockIter::PrevImpl() {
   assert(Valid());
 
+  const auto prev_entry_idx = cur_entry_idx_ - 1;
   assert(prev_entries_idx_ == -1 ||
          static_cast<size_t>(prev_entries_idx_) < prev_entries_.size());
-  --cur_entry_idx_;
   // Check if we can use cached prev_entries_
   if (prev_entries_idx_ > 0 &&
       prev_entries_[prev_entries_idx_].offset == current_) {
@@ -273,7 +126,9 @@ void DataBlockIter::PrevImpl() {
     // (i.e., keys in it are not actually pinned).
     raw_key_.SetKey(current_key, raw_key_cached /* copy */);
     value_ = current_prev_entry.value;
-
+    // Set entry_ using stored entry_size for NextEntryOffset() to work
+    entry_ = Slice(data_ + current_, current_prev_entry.entry_size);
+    cur_entry_idx_ = prev_entry_idx;
     return;
   }
 
@@ -287,15 +142,15 @@ void DataBlockIter::PrevImpl() {
   while (GetRestartPoint(restart_index_) >= original) {
     if (restart_index_ == 0) {
       // No more entries
-      current_ = restarts_;
+      current_ = GetKeysEndOffset();
       restart_index_ = num_restarts_;
+      cur_entry_idx_ = prev_entry_idx;
       return;
     }
     restart_index_--;
   }
 
   SeekToRestartPoint(restart_index_);
-
   do {
     bool is_shared = false;
     if (!ParseNextDataKey(&is_shared)) {
@@ -305,19 +160,22 @@ void DataBlockIter::PrevImpl() {
 
     if (raw_key_.IsKeyPinned()) {
       // The key is not delta encoded
-      prev_entries_.emplace_back(current_, current_key.data(), 0,
-                                 current_key.size(), value());
+      prev_entries_.emplace_back(current_, static_cast<uint32_t>(entry_.size()),
+                                 current_key.data(), 0, current_key.size(),
+                                 value());
     } else {
       // The key is delta encoded, cache decoded key in buffer
       size_t new_key_offset = prev_entries_keys_buff_.size();
       prev_entries_keys_buff_.append(current_key.data(), current_key.size());
 
-      prev_entries_.emplace_back(current_, nullptr, new_key_offset,
-                                 current_key.size(), value());
+      prev_entries_.emplace_back(current_, static_cast<uint32_t>(entry_.size()),
+                                 nullptr, new_key_offset, current_key.size(),
+                                 value());
     }
     // Loop until end of current entry hits the start of original entry
   } while (NextEntryOffset() < original);
   prev_entries_idx_ = static_cast<int32_t>(prev_entries_.size()) - 1;
+  cur_entry_idx_ = prev_entry_idx;
 }
 
 void DataBlockIter::SeekImpl(const Slice& target) {
@@ -416,15 +274,12 @@ bool DataBlockIter::SeekForGetImpl(const Slice& target) {
   assert(restart_index < num_restarts_);
   SeekToRestartPoint(restart_index);
   current_ = GetRestartPoint(restart_index);
-  cur_entry_idx_ =
-      static_cast<int32_t>(restart_index * block_restart_interval_) - 1;
 
-  uint32_t limit = restarts_;
+  uint32_t limit = GetKeysEndOffset();
   if (restart_index + 1 < num_restarts_) {
     limit = GetRestartPoint(restart_index + 1);
   }
   while (current_ < limit) {
-    ++cur_entry_idx_;
     bool shared;
     // Here we only linear seek the target key inside the restart interval.
     // If a key does not exist inside a restart interval, we avoid
@@ -511,7 +366,7 @@ void IndexBlockIter::SeekImpl(const Slice& target) {
       // This is to let the caller to distinguish between non-existing prefix,
       // and when key is larger than the last key, which both set Valid() to
       // false.
-      current_ = restarts_;
+      current_ = GetKeysEndOffset();
       status_ = Status::NotFound();
     }
     // restart interval must be one when hash search is enabled so the binary
@@ -560,7 +415,6 @@ void DataBlockIter::SeekForPrevImpl(const Slice& target) {
     return;
   }
   FindKeyAfterBinarySeek(seek_key, index, skip_linear_scan);
-
   if (!Valid()) {
     if (status_.ok()) {
       SeekToLastImpl();
@@ -606,7 +460,6 @@ void DataBlockIter::SeekToFirstImpl() {
   SeekToRestartPoint(0);
   bool is_shared = false;
   ParseNextDataKey(&is_shared);
-  cur_entry_idx_ = 0;
 }
 
 void MetaBlockIter::SeekToFirstImpl() {
@@ -615,8 +468,7 @@ void MetaBlockIter::SeekToFirstImpl() {
   }
   SeekToRestartPoint(0);
   bool is_shared = false;
-  ParseNextKey<CheckAndDecodeEntry>(&is_shared);
-  cur_entry_idx_ = 0;
+  ParseNextKey<DecodeEntry, true>(&is_shared);
 }
 
 void IndexBlockIter::SeekToFirstImpl() {
@@ -631,7 +483,6 @@ void IndexBlockIter::SeekToFirstImpl() {
   status_ = Status::OK();
   SeekToRestartPoint(0);
   ParseNextIndexKey();
-  cur_entry_idx_ = 0;
 }
 
 void DataBlockIter::SeekToLastImpl() {
@@ -640,10 +491,10 @@ void DataBlockIter::SeekToLastImpl() {
   }
   SeekToRestartPoint(num_restarts_ - 1);
   bool is_shared = false;
-  cur_entry_idx_ = (num_restarts_ - 1) * block_restart_interval_;
-  while (ParseNextDataKey(&is_shared) && NextEntryOffset() < restarts_) {
+
+  while (ParseNextDataKey(&is_shared) &&
+         NextEntryOffset() < GetKeysEndOffset()) {
     // Keep skipping
-    ++cur_entry_idx_;
   }
 }
 
@@ -654,12 +505,9 @@ void MetaBlockIter::SeekToLastImpl() {
   SeekToRestartPoint(num_restarts_ - 1);
   bool is_shared = false;
   assert(num_restarts_ >= 1);
-  cur_entry_idx_ =
-      static_cast<int32_t>((num_restarts_ - 1) * block_restart_interval_);
-  while (ParseNextKey<CheckAndDecodeEntry>(&is_shared) &&
-         NextEntryOffset() < restarts_) {
+  while (ParseNextKey<DecodeEntry, true>(&is_shared) &&
+         NextEntryOffset() < GetKeysEndOffset()) {
     // Will probably never reach here since restart_interval is always 1
-    ++cur_entry_idx_;
   }
 }
 
@@ -669,32 +517,54 @@ void IndexBlockIter::SeekToLastImpl() {
   }
   status_ = Status::OK();
   SeekToRestartPoint(num_restarts_ - 1);
-  cur_entry_idx_ = (num_restarts_ - 1) * block_restart_interval_;
-  while (ParseNextIndexKey() && NextEntryOffset() < restarts_) {
-    ++cur_entry_idx_;
+  while (ParseNextIndexKey() && NextEntryOffset() < GetKeysEndOffset()) {
   }
 }
 
 template <class TValue>
-template <typename DecodeEntryFunc>
+template <typename DecodeEntryFunc, bool StrictCheck>
 bool BlockIter<TValue>::ParseNextKey(bool* is_shared) {
   current_ = NextEntryOffset();
+  ++cur_entry_idx_;
   const char* p = data_ + current_;
-  const char* limit = data_ + restarts_;  // Restarts come right after data
+  const char* key_limit = data_ + GetKeysEndOffset();
 
-  if (p >= limit) {
+  if (p >= key_limit) {
     // No more entries to return.  Mark as invalid.
-    current_ = restarts_;
+    current_ = GetKeysEndOffset();
     restart_index_ = num_restarts_;
     return false;
   }
+
   // Decode next entry
   uint32_t shared, non_shared, value_length;
-  p = DecodeEntryFunc()(p, limit, &shared, &non_shared, &value_length);
+  uint32_t value_offset = 0;
+
+  assert(cur_entry_idx_ >= 0);
+  assert(values_section_ == nullptr || block_restart_interval_ > 0);
+  bool value_offset_encoded =
+      values_section_ && cur_entry_idx_ % block_restart_interval_ == 0;
+
+  auto p_old = p;
+  p = DecodeEntryFunc()(p, key_limit, &shared, &non_shared, &value_length,
+                        value_offset_encoded ? &value_offset : nullptr);
+
   if (p == nullptr || raw_key_.Size() < shared) {
     CorruptionError();
     return false;
   } else {
+    if constexpr (StrictCheck) {
+      auto entry_length =
+          non_shared + (values_section_ == nullptr ? value_length : 0);
+      if (static_cast<uint32_t>(key_limit - p) < entry_length) {
+        CorruptionError();
+        return false;
+      }
+    }
+
+    assert(values_section_ == nullptr ||
+           cur_entry_idx_ % block_restart_interval_ != 0 || shared == 0);
+    entry_ = Slice(p_old, p - p_old + non_shared);
     if (shared == 0) {
       *is_shared = false;
       // If this key doesn't share any bytes with prev key, and no min timestamp
@@ -714,15 +584,36 @@ bool BlockIter<TValue>::ParseNextKey(bool* is_shared) {
         raw_key_.TrimAppend(shared, p, non_shared);
       }
     }
-    value_ = Slice(p + non_shared, value_length);
+
     if (shared == 0) {
       while (restart_index_ + 1 < num_restarts_ &&
              GetRestartPoint(restart_index_ + 1) < current_) {
         ++restart_index_;
       }
     }
-    // else we are in the middle of a restart interval and the restart_index_
-    // thus has not changed
+
+    if (values_section_) {
+      if (value_offset_encoded) {
+        // Restart point, derive from offset
+        value_ = Slice(values_section_ + value_offset, value_length);
+      } else {
+        // Non-restart point, derive from previous value
+        assert(value_.data() >= values_section_);
+        value_ = Slice(value_.data() + value_.size(), value_length);
+      }
+
+      if constexpr (StrictCheck) {
+        if ((value_.data() + value_.size()) > data_ + restarts_) {
+          CorruptionError();
+          return false;
+        }
+      }
+    } else {
+      value_ = Slice(entry_.data() + entry_.size(), value_length);
+      // extend entry slice to contain value as well
+      entry_ = Slice(entry_.data(), entry_.size() + value_.size());
+    }
+    assert((value_.data() + value_.size()) <= data_ + restarts_);
     return true;
   }
 }
@@ -782,11 +673,17 @@ bool IndexBlockIter::ParseNextIndexKey() {
 void IndexBlockIter::DecodeCurrentValue(bool is_shared) {
   Slice v(value_.data(), data_ + restarts_ - value_.data());
   // Delta encoding is used if `shared` != 0.
+  assert(!value_delta_encoded_ || value_.size() == 0);
   Status decode_s __attribute__((__unused__)) = decoded_value_.DecodeFrom(
       &v, have_first_key_,
       (value_delta_encoded_ && is_shared) ? &decoded_value_.handle : nullptr);
   assert(decode_s.ok());
   value_ = Slice(value_.data(), v.data() - value_.data());
+  if (!values_section_ && value_delta_encoded_) {
+    assert(entry_.data() + entry_.size() == value_.data());
+    // values are inlined in the entry, so need to set next offset accordingly
+    entry_ = Slice(entry_.data(), entry_.size() + value_.size());
+  }
 
   if (global_seqno_state_ != nullptr) {
     // Overwrite sequence number the same way as in DataBlockIter.
@@ -824,8 +721,8 @@ void BlockIter<TValue>::FindKeyAfterBinarySeek(const Slice& target,
   // to follow it up with NextImpl() to position the iterator at the restart
   // key.
   SeekToRestartPoint(index);
-  cur_entry_idx_ = static_cast<int32_t>(index * block_restart_interval_) - 1;
   NextImpl();
+  assert(cur_entry_idx_ >= 0);
 
   if (!skip_linear_scan) {
     // Linear search (within restart block) for first key >= target
@@ -862,9 +759,10 @@ template <class TValue>
 template <typename DecodeKeyFunc>
 bool BlockIter<TValue>::GetRestartKey(uint32_t index, Slice* key) {
   uint32_t region_offset = GetRestartPoint(index);
-  uint32_t shared, non_shared;
-  const char* key_ptr = DecodeKeyFunc()(
-      data_ + region_offset, data_ + restarts_, &shared, &non_shared);
+  uint32_t shared, non_shared, value_offset;
+  const char* key_ptr =
+      DecodeKeyFunc()(data_ + region_offset, data_ + restarts_, &shared,
+                      &non_shared, values_section_ ? &value_offset : nullptr);
   if (key_ptr == nullptr || (shared != 0)) {
     CorruptionError();
     return false;
@@ -910,7 +808,6 @@ bool BlockIter<TValue>::BinarySeekRestartPointIndex(const Slice& target,
   while (left != right) {
     // The `mid` is computed by rounding up so it lands in (`left`, `right`].
     int64_t mid = left + (right - left + 1) / 2;
-
     assert(left < mid && mid <= right);
 
     Slice mid_key;
@@ -969,20 +866,24 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
   }
 
   *skip_linear_scan = false;
+  // Currently it is assumed that comparator is always bytewise comparator, but
+  // it may also be useful to to generalize to reverse bytewise in the future.
   assert(icmp_.user_comparator() == BytewiseComparator());
 
   int64_t left = -1;
   int64_t right = num_restarts_ - 1;
-  int64_t shared_prefix_len = -1;
+  size_t shared_user_prefix_len = 0;
 
   Slice left_key;
   Slice right_key;
+  Slice left_key_suffix;
+  Slice right_key_suffix;
+  Slice target_suffix = target;
   bool seek_failed = false;
-
-#ifndef NDEBUG
-  // used to validate invariants
   bool first_iter = true;
-#endif
+  uint64_t left_val = 0;
+  uint64_t right_val = 0;
+  uint64_t target_val = 0;
 
   // A poor search is when less than half the search space is reduced, because
   // binary search would do better. When there are kMaxPoorSearches in a row,
@@ -994,7 +895,9 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
   // - left < mid <= right, and arr[left] < target < arr[right + 1]
   //
   // The first iteration is used as an early optimization to determine initial
-  // bounds, and whether target is within those bounds
+  // bounds, and whether target is within those bounds.
+  const bool is_user_key = raw_key_.IsUserKey();
+  const Slice target_user_key = is_user_key ? target : ExtractUserKey(target);
   while (left != right) {
     int64_t mid = 0;
 
@@ -1007,13 +910,12 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
       // Interpolation seek reads left and right boundaries anyways, so we can
       // set left = 0. The invariant that left <= target is still held because
       // we early exit if left > target for the first iteration.
-      const auto usable_left = std::max<int64_t>(left, 0);
+      const uint32_t usable_left =
+          static_cast<uint32_t>(std::max<int64_t>(left, 0));
 
       // First iteration: decode both boundary keys and compute shared prefix.
-      if (shared_prefix_len < 0) {
-        assert(first_iter);
-        if (!GetRestartKey<DecodeKeyFunc>(static_cast<uint32_t>(usable_left),
-                                          &left_key)) {
+      if (first_iter) {
+        if (!GetRestartKey<DecodeKeyFunc>(usable_left, &left_key)) {
           return false;
         }
 
@@ -1022,20 +924,78 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
           return false;
         }
 
-        // Compute the shared prefix length between smallest index key and
-        // largest index key this can be used to "normalize" the values
-        // calculated during interpolation search.
-        shared_prefix_len =
-            static_cast<int64_t>(left_key.difference_offset(right_key));
-      }
-      assert(shared_prefix_len >= 0);
+        // Compute the shared prefix length between the user key portions of
+        // the boundary keys. This is used to "normalize" the values calculated
+        // during interpolation search.
+        shared_user_prefix_len = left_key.difference_offset(right_key);
+        if (!is_user_key) {
+          // Ensure shared_user_prefix_len is only limited to user key. Suppose
+          // that the shared prefix of both keys are extended into the internal
+          // footer. If they are not the same user keys, then it is guaranteed
+          // left is the shorter one due to bytewise comparator. For reverse
+          // bytewise, this would be flipped.
+          shared_user_prefix_len = std::min<size_t>(
+              shared_user_prefix_len, left_key.size() - kNumInternalBytes);
+          assert(shared_user_prefix_len <=
+                 right_key.size() - kNumInternalBytes);
+        }
 
-      size_t spl = static_cast<size_t>(shared_prefix_len);
-      assert(spl <= left_key.size() && spl <= right_key.size());
-      uint64_t left_val = ReadBe64FromKey(left_key, raw_key_.IsUserKey(), spl);
-      uint64_t right_val =
-          ReadBe64FromKey(right_key, raw_key_.IsUserKey(), spl);
-      uint64_t target_val = ReadBe64FromKey(target, raw_key_.IsUserKey(), spl);
+        left_val =
+            ReadBe64FromKey(left_key, is_user_key, shared_user_prefix_len);
+        right_val =
+            ReadBe64FromKey(right_key, is_user_key, shared_user_prefix_len);
+        target_val =
+            ReadBe64FromKey(target, is_user_key, shared_user_prefix_len);
+      }
+
+      assert(shared_user_prefix_len <= left_key.size() &&
+             shared_user_prefix_len <= right_key.size());
+
+      if (first_iter && shared_user_prefix_len > 0) {
+        // It is not guaranteed that the shared_prefix of the left and right
+        // boundaries is a valid prefix of the target. If it is not, then we can
+        // early exit.
+        size_t cmp_len =
+            std::min(target_user_key.size(), shared_user_prefix_len);
+        int cmp = memcmp(target_user_key.data(), left_key.data(), cmp_len);
+        if (cmp < 0 || (cmp == 0 && cmp_len < shared_user_prefix_len)) {
+#ifndef NDEBUG
+          IterKey tmp_key;
+          tmp_key.SetIsUserKey(is_user_key);
+          UpdateRawKeyAndMaybePadMinTimestamp(tmp_key, left_key);
+          assert(CompareKey(tmp_key, target) >= 0);
+#endif
+          // if target size is less than shared_prefix length, and cmp == 0,
+          // then it is guaranteed <= left
+          *skip_linear_scan = true;
+          *index = usable_left;
+          return true;
+        } else if (cmp > 0) {
+#ifndef NDEBUG
+          IterKey tmp_key;
+          tmp_key.SetIsUserKey(is_user_key);
+          UpdateRawKeyAndMaybePadMinTimestamp(tmp_key, right_key);
+          assert(CompareKey(tmp_key, target) < 0);
+#endif
+          *index = static_cast<uint32_t>(right);
+          return true;
+        }
+      }
+
+      assert(shared_user_prefix_len <= target_user_key.size());
+      assert(memcmp(left_key.data(), target_user_key.data(),
+                    shared_user_prefix_len) == 0);
+      assert(memcmp(right_key.data(), target_user_key.data(),
+                    shared_user_prefix_len) == 0);
+
+      if (first_iter) {
+        left_key_suffix = Slice(left_key.data() + shared_user_prefix_len,
+                                left_key.size() - shared_user_prefix_len);
+        right_key_suffix = Slice(right_key.data() + shared_user_prefix_len,
+                                 right_key.size() - shared_user_prefix_len);
+        target_suffix = Slice(target.data() + shared_user_prefix_len,
+                              target.size() - shared_user_prefix_len);
+      }
 
       if (left_val > right_val) {
         CorruptionError("left key is greater than right key");
@@ -1047,13 +1007,13 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
 
       if (target_val < left_val) {
         assert(first_iter);
-        assert(CompareKey(left_key, target) > 0);
+        assert(CompareKey(left_key_suffix, target_suffix) > 0);
         lte_left = true;
       } else if (target_val == left_val) {
         // target_val == left_val doesn't imply target == left_key
         // because ReadBe64FromKey only reads 8 bytes and skips sequence
         // numbers. We need to check actual key order.
-        if (CompareKey(left_key, target) >= 0) {
+        if (CompareKey(left_key_suffix, target_suffix) >= 0) {
           assert(first_iter);
           lte_left = true;
         }
@@ -1063,7 +1023,7 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
         if (target_val > right_val) {
           // note that we only ever guarantee arr[target] < arr[right + 1], so
           // it is possible to end up here even on non-first iteration
-          assert(CompareKey(right_key, target) < 0);
+          assert(CompareKey(right_key_suffix, target_suffix) < 0);
           gt_right = true;
         } else if (right_val == left_val) {
           // cannot divide by 0
@@ -1073,17 +1033,25 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
 
       // early exit if key is not within bounds
       if (lte_left) {
+#ifndef NDEBUG
         assert(!seek_failed);
-        UpdateRawKeyAndMaybePadMinTimestamp(left_key);
-        assert(CompareCurrentKey(target) >= 0);
+        IterKey tmp_key;
+        tmp_key.SetIsUserKey(is_user_key);
+        UpdateRawKeyAndMaybePadMinTimestamp(tmp_key, left_key);
+        assert(CompareKey(tmp_key, target) >= 0);
+#endif
         *skip_linear_scan = true;
-        *index = static_cast<uint32_t>(usable_left);
+        *index = usable_left;
         return true;
       }
       if (gt_right) {
+#ifndef NDEBUG
         assert(!seek_failed);
-        UpdateRawKeyAndMaybePadMinTimestamp(right_key);
-        assert(CompareCurrentKey(target) < 0);
+        IterKey tmp_key;
+        tmp_key.SetIsUserKey(is_user_key);
+        UpdateRawKeyAndMaybePadMinTimestamp(tmp_key, right_key);
+        assert(CompareKey(tmp_key, target) < 0);
+#endif
         *index = static_cast<uint32_t>(right);
         return true;
       }
@@ -1124,14 +1092,18 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
       return false;
     }
 
-    UpdateRawKeyAndMaybePadMinTimestamp(mid_key);
+    Slice mid_key_suffix(mid_key.data() + shared_user_prefix_len,
+                         mid_key.size() - shared_user_prefix_len);
 
-    int cmp = CompareCurrentKey(target);
+    UpdateRawKeyAndMaybePadMinTimestamp(mid_key_suffix);
+    int cmp = CompareCurrentKey(target_suffix);
 
     int64_t previous_search_space = right - left;
     if (cmp < 0) {
       left = mid;
       left_key = mid_key;
+      left_key_suffix = mid_key_suffix;
+      left_val = ReadBe64FromKey(left_key, is_user_key, shared_user_prefix_len);
     } else if (cmp > 0) {
       right = mid - 1;
       if (!seek_failed && left != right) {
@@ -1139,6 +1111,10 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
                                           &right_key)) {
           return false;
         }
+        right_key_suffix = Slice(right_key.data() + shared_user_prefix_len,
+                                 right_key.size() - shared_user_prefix_len);
+        right_val =
+            ReadBe64FromKey(right_key, is_user_key, shared_user_prefix_len);
       }
     } else {
       *skip_linear_scan = true;
@@ -1154,9 +1130,7 @@ bool BlockIter<TValue>::InterpolationSeekRestartPointIndex(
       continuous_poor_searches = 0;
     }
 
-#ifndef NDEBUG
     first_iter = false;
-#endif
   }
 
   if (left == -1) {
@@ -1228,7 +1202,7 @@ bool IndexBlockIter::BinaryBlockIndexSeek(const Slice& target,
     if (block_ids[left] > 0 &&
         (left == left_bound || block_ids[left - 1] != block_ids[left] - 1) &&
         CompareBlockKey(block_ids[left] - 1, target) > 0) {
-      current_ = restarts_;
+      current_ = GetKeysEndOffset();
       *prefix_may_exist = false;
       return false;
     }
@@ -1265,7 +1239,7 @@ bool IndexBlockIter::BinaryBlockIndexSeek(const Slice& target,
     }
 
     // Mark iterator invalid
-    current_ = restarts_;
+    current_ = GetKeysEndOffset();
     return false;
   }
 }
@@ -1284,7 +1258,7 @@ bool IndexBlockIter::PrefixSeek(const Slice& target, uint32_t* index,
   uint32_t num_blocks = prefix_index_->GetBlocks(target, &block_ids);
 
   if (num_blocks == 0) {
-    current_ = restarts_;
+    current_ = GetKeysEndOffset();
     *prefix_may_exist = false;
     return false;
   } else {
@@ -1330,8 +1304,11 @@ Status Block::GetCorruptionStatus() const {
 }
 
 Block::Block(BlockContents&& contents, size_t read_amp_bytes_per_bit,
-             Statistics* statistics)
-    : contents_(std::move(contents)), restart_offset_(0), num_restarts_(0) {
+             Statistics* statistics, uint32_t restart_interval)
+    : contents_(std::move(contents)),
+      restart_offset_(0),
+      num_restarts_(0),
+      block_restart_interval_(restart_interval) {
   TEST_SYNC_POINT("Block::Block:0");
   auto& size = contents_.data.size_;
   // `contents` is assumed to be uncompressed in the proper format
@@ -1343,10 +1320,11 @@ Block::Block(BlockContents&& contents, size_t read_amp_bytes_per_bit,
     restart_offset_ = static_cast<uint32_t>(size);
     size = 0;  // Error marker
   } else {
-    // After DecodeFrom, input has the footer removed. Each case below
-    // may strip additional suffix (e.g., hash index) so that input ends
-    // with just the restart array.
+    // After DecodeFrom, input has the footer (and values_section_offset if
+    // separated_kv) removed. Each case below may strip additional suffix
+    // (e.g., hash index) so that input ends with just the restart array.
     num_restarts_ = footer.num_restarts;
+    is_uniform_ = footer.is_uniform;
     switch (footer.index_type) {
       case BlockBasedTableOptions::kDataBlockBinarySearch:
         break;
@@ -1374,6 +1352,14 @@ Block::Block(BlockContents&& contents, size_t read_amp_bytes_per_bit,
                           num_restarts_ * sizeof(uint32_t);
       }
     }
+    // Set up values_section_ from footer if separated KV storage is used
+    if (size != 0 && footer.separated_kv) {
+      if (footer.values_section_offset > restart_offset_) {
+        size = 0;  // Error marker
+      } else {
+        values_section_ = data() + footer.values_section_offset;
+      }
+    }
   }
   if (read_amp_bytes_per_bit != 0 && statistics && size != 0) {
     read_amp_bitmap_.reset(new BlockReadAmpBitmap(
@@ -1397,7 +1383,10 @@ void Block::InitializeDataBlockProtectionInfo(uint8_t protection_bytes_per_key,
         nullptr /* stats */, true /* block_contents_pinned */,
         true /* user_defined_timestamps_persisted */)};
     if (iter->status().ok()) {
-      block_restart_interval_ = iter->GetRestartInterval();
+      // Only calculate restart interval if not already set via table properties
+      if (block_restart_interval_ == 0) {
+        block_restart_interval_ = iter->GetRestartInterval();
+      }
     }
     uint32_t num_keys = 0;
     if (iter->status().ok()) {
@@ -1430,12 +1419,12 @@ void Block::InitializeIndexBlockProtectionInfo(uint8_t protection_bytes_per_key,
                                                bool index_has_first_key) {
   protection_bytes_per_key_ = 0;
   if (num_restarts_ > 0 && protection_bytes_per_key > 0) {
-    // Note that `global_seqno` and `key_includes_seq` are hardcoded here. They
-    // do not impact how the index block is parsed. During checksum
+    // Note that `global_seqno` and `key_includes_seq` are hardcoded here.
+    // They do not impact how the index block is parsed. During checksum
     // construction/verification, we use the entire key buffer from
-    // raw_key_.GetKey() returned by iter->key() as the `key` part of key-value
-    // checksum, and the content of this buffer do not change for different
-    // values of `global_seqno` or `key_includes_seq`.
+    // raw_key_.GetKey() returned by iter->key() as the `key` part of
+    // key-value checksum, and the content of this buffer do not change for
+    // different values of `global_seqno` or `key_includes_seq`.
     // TODO(yuzhangyu): handle the implication of padding timestamp for kv
     // protection.
     std::unique_ptr<IndexBlockIter> iter{NewIndexIterator(
@@ -1446,7 +1435,10 @@ void Block::InitializeIndexBlockProtectionInfo(uint8_t protection_bytes_per_key,
         true /* user_defined_timestamps_persisted*/,
         nullptr /* prefix_index */)};
     if (iter->status().ok()) {
-      block_restart_interval_ = iter->GetRestartInterval();
+      // Only calculate restart interval if not already set via table properties
+      if (block_restart_interval_ == 0) {
+        block_restart_interval_ = iter->GetRestartInterval();
+      }
     }
     uint32_t num_keys = 0;
     if (iter->status().ok()) {
@@ -1518,7 +1510,7 @@ MetaBlockIter* Block::NewMetaIterator(bool block_contents_pinned) {
   } else {
     iter->Initialize(data(), restart_offset_, num_restarts_,
                      block_contents_pinned, protection_bytes_per_key_,
-                     kv_checksum_, block_restart_interval_);
+                     kv_checksum_, block_restart_interval_, values_section_);
   }
   return iter;
 }
@@ -1548,10 +1540,12 @@ DataBlockIter* Block::NewDataIterator(const Comparator* raw_ucmp,
         read_amp_bitmap_.get(), block_contents_pinned,
         user_defined_timestamps_persisted,
         data_block_hash_index_.Valid() ? &data_block_hash_index_ : nullptr,
-        protection_bytes_per_key_, kv_checksum_, block_restart_interval_);
+        protection_bytes_per_key_, kv_checksum_, block_restart_interval_,
+        values_section_);
     if (read_amp_bitmap_) {
       if (read_amp_bitmap_->GetStatistics() != stats) {
-        // DB changed the Statistics pointer, we need to notify read_amp_bitmap_
+        // DB changed the Statistics pointer, we need to notify
+        // read_amp_bitmap_
         read_amp_bitmap_->SetStatistics(stats);
       }
     }
@@ -1584,12 +1578,23 @@ IndexBlockIter* Block::NewIndexIterator(
   } else {
     BlockPrefixIndex* prefix_index_ptr =
         total_order_seek ? nullptr : prefix_index;
-    ret_iter->Initialize(raw_ucmp, data(), restart_offset_, num_restarts_,
-                         global_seqno, prefix_index_ptr, have_first_key,
-                         key_includes_seq, value_is_full, block_contents_pinned,
-                         user_defined_timestamps_persisted,
-                         protection_bytes_per_key_, kv_checksum_,
-                         block_restart_interval_, index_block_search_type);
+
+    // Resolve kAuto to a concrete search type based on the block's
+    // uniformity flag. Interpolation search requires bytewise comparator;
+    // fall back to binary search otherwise.
+    auto resolved_search_type = index_block_search_type;
+    if (resolved_search_type == BlockBasedTableOptions::kAuto) {
+      resolved_search_type = (is_uniform_ && raw_ucmp == BytewiseComparator())
+                                 ? BlockBasedTableOptions::kInterpolation
+                                 : BlockBasedTableOptions::kBinary;
+    }
+
+    ret_iter->Initialize(
+        raw_ucmp, data(), restart_offset_, num_restarts_, global_seqno,
+        prefix_index_ptr, have_first_key, key_includes_seq, value_is_full,
+        block_contents_pinned, user_defined_timestamps_persisted,
+        protection_bytes_per_key_, kv_checksum_, block_restart_interval_,
+        values_section_, resolved_search_type);
   }
 
   return ret_iter;

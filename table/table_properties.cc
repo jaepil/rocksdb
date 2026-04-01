@@ -47,6 +47,8 @@ std::string TableProperties::ToString(const std::string& prop_delim,
   // Basic Info
   AppendProperty(result, "# data blocks", num_data_blocks, prop_delim,
                  kv_delim);
+  AppendProperty(result, "# uniform blocks", num_uniform_blocks, prop_delim,
+                 kv_delim);
   AppendProperty(result, "# entries", num_entries, prop_delim, kv_delim);
   AppendProperty(result, "# deletions", num_deletions, prop_delim, kv_delim);
   AppendProperty(result, "# merge operands", num_merge_operands, prop_delim,
@@ -192,6 +194,7 @@ void TableProperties::Add(const TableProperties& tp) {
   raw_key_size += tp.raw_key_size;
   raw_value_size += tp.raw_value_size;
   num_data_blocks += tp.num_data_blocks;
+  num_uniform_blocks += tp.num_uniform_blocks;
   num_entries += tp.num_entries;
   num_filter_entries += tp.num_filter_entries;
   num_deletions += tp.num_deletions;
@@ -215,6 +218,7 @@ TableProperties::GetAggregatablePropertiesAsMap() const {
   rv["raw_key_size"] = raw_key_size;
   rv["raw_value_size"] = raw_value_size;
   rv["num_data_blocks"] = num_data_blocks;
+  rv["num_uniform_blocks"] = num_uniform_blocks;
   rv["num_entries"] = num_entries;
   rv["num_filter_entries"] = num_filter_entries;
   rv["num_deletions"] = num_deletions;
@@ -280,6 +284,8 @@ const std::string TablePropertiesNames::kRawValueSize =
     "rocksdb.raw.value.size";
 const std::string TablePropertiesNames::kNumDataBlocks =
     "rocksdb.num.data.blocks";
+const std::string TablePropertiesNames::kNumUniformBlocks =
+    "rocksdb.num.uniform.blocks";
 const std::string TablePropertiesNames::kNumEntries = "rocksdb.num.entries";
 const std::string TablePropertiesNames::kNumFilterEntries =
     "rocksdb.num.filter_entries";
@@ -328,6 +334,12 @@ const std::string TablePropertiesNames::kKeyLargestSeqno =
     "rocksdb.key.largest.seqno";
 const std::string TablePropertiesNames::kKeySmallestSeqno =
     "rocksdb.key.smallest.seqno";
+const std::string TablePropertiesNames::kDataBlockRestartInterval =
+    "rocksdb.data.block.restart.interval";
+const std::string TablePropertiesNames::kIndexBlockRestartInterval =
+    "rocksdb.index.block.restart.interval";
+const std::string TablePropertiesNames::kSeparateKeyValueInDataBlock =
+    "rocksdb.separate.key.value.in.data.block";
 
 static std::unordered_map<std::string, OptionTypeInfo>
     table_properties_type_info = {
@@ -373,6 +385,10 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kNone}},
         {"num_data_blocks",
          {offsetof(struct TableProperties, num_data_blocks),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"num_uniform_blocks",
+         {offsetof(struct TableProperties, num_uniform_blocks),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"num_entries",
@@ -448,6 +464,18 @@ static std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kNone}},
         {"key_smallest_seqno",
          {offsetof(struct TableProperties, key_smallest_seqno),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"data_block_restart_interval",
+         {offsetof(struct TableProperties, data_block_restart_interval),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"index_block_restart_interval",
+         {offsetof(struct TableProperties, index_block_restart_interval),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"separate_key_value_in_data_block",
+         {offsetof(struct TableProperties, separate_key_value_in_data_block),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
         {"db_id",

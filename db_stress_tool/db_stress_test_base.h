@@ -14,6 +14,7 @@
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_shared_state.h"
 #include "rocksdb/experimental.h"
+#include "rocksdb/user_defined_index.h"
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -32,6 +33,12 @@ class StressTest {
            FaultInjectionTestFS::IsInjectedError(error_s) &&
            !status_to_io_status(Status(error_s)).GetDataLoss();
   }
+
+  // Returns true if the status is an expected transactional error, including
+  // lock conflicts (deadlock or timeout) from MaybeAddKeyToTxnForRYW writing
+  // to the same key space without the stress-test-level mutex, and TryAgain
+  // from optimistic transactions when conflict detection retries are exhausted.
+  static bool IsExpectedTxnError(const Status& s);
 
   StressTest();
 
@@ -404,6 +411,7 @@ class StressTest {
   std::shared_ptr<Cache> cache_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
+  std::unique_ptr<DB> db_owner_;
   DB* db_;
   TransactionDB* txn_db_;
   OptimisticTransactionDB* optimistic_txn_db_;
@@ -421,8 +429,9 @@ class StressTest {
   std::vector<std::string> options_index_;
   std::atomic<bool> db_preload_finished_;
   std::shared_ptr<SstQueryFilterConfigsManager::Factory> sqfc_factory_;
+  std::shared_ptr<UserDefinedIndexFactory> udi_factory_;
 
-  DB* secondary_db_;
+  std::unique_ptr<DB> secondary_db_;
   std::vector<ColumnFamilyHandle*> secondary_cfhs_;
   bool is_db_stopped_;
 };
@@ -436,7 +445,9 @@ bool InitializeOptionsFromFile(Options& options);
 // input arguments.
 void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
-    const std::shared_ptr<const FilterPolicy>& filter_policy, Options& options);
+    const std::shared_ptr<const FilterPolicy>& filter_policy,
+    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
+    Options& options);
 
 // Initialize `options` on which `InitializeOptionsFromFile()` and
 // `InitializeOptionsFromFlags()` have both been called already.

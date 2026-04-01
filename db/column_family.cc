@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -1563,38 +1564,40 @@ Status ColumnFamilyData::ValidateOptions(
     }
   }
 
+  if (cf_options.read_triggered_compaction_threshold < 0.0 ||
+      std::isnan(cf_options.read_triggered_compaction_threshold) ||
+      std::isinf(cf_options.read_triggered_compaction_threshold)) {
+    return Status::InvalidArgument(
+        "read_triggered_compaction_threshold must be >= 0.0 and finite. "
+        "Use 0.0 to disable.");
+  }
+
   if (cf_options.compaction_style == kCompactionStyleFIFO &&
       db_options.max_open_files != -1 && cf_options.ttl > 0) {
     return Status::NotSupported(
         "FIFO compaction only supported with max_open_files = -1.");
   }
 
-  if (cf_options.compaction_options_fifo.use_kv_ratio_compaction) {
-    if (cf_options.compaction_style != kCompactionStyleFIFO) {
-      return Status::InvalidArgument(
-          "use_kv_ratio_compaction is only supported with FIFO compaction "
-          "style.");
+  if (db_options.open_files_async) {
+    // FIFO TTL picker relies on reading the files table properties inside a
+    // DB mutex. This can be slow if files are opened asynchronously, so we
+    // disable it.
+    //
+    // TODO: consider blocking fifo compaction until async file open task
+    // completes.
+    if (cf_options.compaction_style == kCompactionStyleFIFO) {
+      return Status::NotSupported(
+          "FIFO compaction is not supported with open_files_async = true.");
     }
-    if (!cf_options.compaction_options_fifo.allow_compaction) {
+    // Open files async is not useful if skip_stats_update_on_db_open=true
+    // because DB open will still block on IO.
+    //
+    // TODO: consider moving stats update inside async file open background
+    // task.
+    if (!db_options.skip_stats_update_on_db_open) {
       return Status::InvalidArgument(
-          "use_kv_ratio_compaction requires allow_compaction = true. "
-          "allow_compaction enables intra-L0 compaction, and "
-          "use_kv_ratio_compaction selects the picking strategy.");
+          "open_files_async requires skip_stats_update_on_db_open = true.");
     }
-    if (cf_options.compaction_options_fifo.max_data_files_size == 0) {
-      return Status::InvalidArgument(
-          "use_kv_ratio_compaction requires max_data_files_size > 0 to "
-          "compute the target compacted file size from data capacity.");
-    }
-  }
-
-  if (cf_options.compaction_options_fifo.max_data_files_size > 0 &&
-      cf_options.compaction_options_fifo.max_data_files_size <
-          cf_options.compaction_options_fifo.max_table_files_size) {
-    return Status::InvalidArgument(
-        "max_data_files_size (total data = SST + blob) must be >= "
-        "max_table_files_size (SST only) when non-zero, since total data "
-        "always includes SST data.");
   }
 
   std::vector<uint32_t> supported{0, 1, 2, 4, 8};

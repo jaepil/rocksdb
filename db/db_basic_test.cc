@@ -91,17 +91,15 @@ class DBBasicTest : public DBTestBase {
 TEST_F(DBBasicTest, OpenWhenOpen) {
   Options options = CurrentOptions();
   options.env = env_;
-  DB* db2 = nullptr;
+  std::unique_ptr<DB> db2;
   Status s = DB::Open(options, dbname_, &db2);
-  ASSERT_NOK(s) << [db2]() {
-    delete db2;
+  ASSERT_NOK(s) << [&db2]() {
+    db2.reset();
     return "db2 open: ok";
   }();
   ASSERT_EQ(Status::Code::kIOError, s.code());
   ASSERT_EQ(Status::SubCode::kNone, s.subcode());
   ASSERT_TRUE(strstr(s.getState(), "lock ") != nullptr);
-
-  delete db2;
 }
 
 TEST_F(DBBasicTest, EnableDirectIOWithZeroBuf) {
@@ -586,14 +584,14 @@ TEST_F(DBBasicTest, GetSnapshot) {
 
 TEST_F(DBBasicTest, CheckLock) {
   do {
-    DB* localdb = nullptr;
+    std::unique_ptr<DB> localdb;
     Options options = CurrentOptions();
     ASSERT_OK(TryReopen(options));
 
     // second open should fail
     Status s = DB::Open(options, dbname_, &localdb);
-    ASSERT_NOK(s) << [localdb]() {
-      delete localdb;
+    ASSERT_NOK(s) << [&localdb]() {
+      localdb.reset();
       return "localdb open: ok";
     }();
 #ifdef OS_LINUX
@@ -862,7 +860,7 @@ TEST_F(DBBasicTest, Snapshot) {
     ASSERT_OK(Put(1, "foo", "1v3"));
 
     {
-      ManagedSnapshot s3(db_);
+      ManagedSnapshot s3(db_.get());
       ASSERT_EQ(3U, GetNumSnapshots());
       ASSERT_EQ(time_snap1, GetTimeOldestSnapshots());
       ASSERT_EQ(GetSequenceOldestSnapshots(), s1->GetSequenceNumber());
@@ -985,7 +983,7 @@ TEST_F(DBBasicTest, DBOpen_Options) {
   Destroy(options);
 
   // Does not exist, and create_if_missing == false: error
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   options.create_if_missing = false;
   Status s = DB::Open(options, dbname_, &db);
   ASSERT_TRUE(strstr(s.ToString().c_str(), "does not exist") != nullptr);
@@ -997,8 +995,7 @@ TEST_F(DBBasicTest, DBOpen_Options) {
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
 
-  delete db;
-  db = nullptr;
+  db.reset();
 
   // Does exist, and error_if_exists == true: error
   options.create_if_missing = false;
@@ -1014,8 +1011,7 @@ TEST_F(DBBasicTest, DBOpen_Options) {
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
 
-  delete db;
-  db = nullptr;
+  db.reset();
 }
 
 TEST_F(DBBasicTest, CompactOnFlush) {
@@ -1320,7 +1316,7 @@ TEST_F(DBBasicTest, DBClose) {
   std::string dbname = test::PerThreadDBPath("db_close_test");
   ASSERT_OK(DestroyDB(dbname, options));
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   TestEnv* env = new TestEnv(env_);
   std::unique_ptr<TestEnv> local_env_guard(env);
   options.create_if_missing = true;
@@ -1333,14 +1329,14 @@ TEST_F(DBBasicTest, DBClose) {
   ASSERT_EQ(env->GetCloseCount(), 1);
   ASSERT_EQ(s, Status::IOError());
 
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 1);
 
   // Do not call DB::Close() and ensure our logger Close() still gets called
   s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
   ASSERT_TRUE(db != nullptr);
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 2);
 
   // close by WaitForCompact() with close_db option
@@ -1355,7 +1351,7 @@ TEST_F(DBBasicTest, DBClose) {
   // see TestLogger::CloseHelper()
   ASSERT_EQ(s, Status::IOError());
 
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 3);
 
   // Provide our own logger and ensure DB::Close() does not close it
@@ -1366,7 +1362,7 @@ TEST_F(DBBasicTest, DBClose) {
 
   s = db->Close();
   ASSERT_EQ(s, Status::OK());
-  delete db;
+  db.reset();
   ASSERT_EQ(env->GetCloseCount(), 3);
   options.info_log.reset();
   ASSERT_EQ(env->GetCloseCount(), 4);
@@ -1384,7 +1380,7 @@ TEST_F(DBBasicTest, DBCloseAllDirectoryFDs) {
 
   ASSERT_OK(DestroyDB(dbname, options));
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::unique_ptr<Env> env = NewCompositeEnv(
       std::make_shared<CountedFileSystem>(FileSystem::Default()));
   options.create_if_missing = true;
@@ -1402,7 +1398,7 @@ TEST_F(DBBasicTest, DBCloseAllDirectoryFDs) {
   ASSERT_EQ(counted_fs->counters()->dir_opens,
             counted_fs->counters()->dir_closes);
   ASSERT_OK(s);
-  delete db;
+  db.reset();
 }
 
 TEST_F(DBBasicTest, DBCloseFlushError) {
@@ -1464,7 +1460,7 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
   }
 
   int get_sv_count = 0;
-  ROCKSDB_NAMESPACE::DBImpl* db = static_cast_with_check<DBImpl>(db_);
+  ROCKSDB_NAMESPACE::DBImpl* db = dbfull();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (++get_sv_count == 2) {
@@ -1536,10 +1532,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCF) {
   ASSERT_EQ(values[2], std::get<2>(cf_kv_vec[1]) + "_2");
 
   for (int cf = 0; cf < 8; ++cf) {
-    auto* cfd =
-        static_cast_with_check<ColumnFamilyHandleImpl>(
-            static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(cf))
-            ->cfd();
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->GetColumnFamilyHandle(cf))
+                    ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVObsolete);
   }
@@ -1625,10 +1620,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFMutex) {
               "cf" + std::to_string(j) + "_val" + std::to_string(retries));
   }
   for (int i = 0; i < 8; ++i) {
-    auto* cfd =
-        static_cast_with_check<ColumnFamilyHandleImpl>(
-            static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(i))
-            ->cfd();
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->GetColumnFamilyHandle(i))
+                    ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
   }
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
@@ -1652,7 +1646,7 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
   }
 
   int get_sv_count = 0;
-  ROCKSDB_NAMESPACE::DBImpl* db = static_cast_with_check<DBImpl>(db_);
+  ROCKSDB_NAMESPACE::DBImpl* db = dbfull();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::MultiCFSnapshot::AfterRefSV", [&](void* /*arg*/) {
         if (++get_sv_count == 2) {
@@ -1693,10 +1687,9 @@ TEST_P(DBMultiGetTestWithParam, MultiGetMultiCFSnapshot) {
     ASSERT_EQ(values[j], "cf" + std::to_string(j) + "_val");
   }
   for (int i = 0; i < 8; ++i) {
-    auto* cfd =
-        static_cast_with_check<ColumnFamilyHandleImpl>(
-            static_cast_with_check<DBImpl>(db_)->GetColumnFamilyHandle(i))
-            ->cfd();
+    auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(
+                    dbfull()->GetColumnFamilyHandle(i))
+                    ->cfd();
     ASSERT_NE(cfd->TEST_GetLocalSV()->Get(), SuperVersion::kSVInUse);
   }
 }
@@ -2542,6 +2535,319 @@ TEST_P(DBMultiGetTestWithParam, MultiGetBatchedValueSizeMultiLevelMerge) {
   }
 }
 
+TEST_P(DBMultiGetTestWithParam, MultiGetMemtableBatchLookup) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  // Skip for unbatched MultiGet
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Insert sorted keys into memtable
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(1, Key(i), "val" + std::to_string(i)));
+  }
+  // Delete some keys
+  ASSERT_OK(Delete(1, Key(25)));
+  ASSERT_OK(Delete(1, Key(75)));
+
+  // MultiGet a batch of keys - mix of existing, deleted, and missing
+  // Store key strings to keep Slice data alive
+  std::vector<std::string> key_strs = {Key(0),  Key(10), Key(25), Key(50),
+                                       Key(75), Key(99), Key(200)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "val0");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "val10");
+  ASSERT_TRUE(statuses[2].IsNotFound());  // deleted
+  ASSERT_OK(statuses[3]);
+  ASSERT_EQ(values[3].ToString(), "val50");
+  ASSERT_TRUE(statuses[4].IsNotFound());  // deleted
+  ASSERT_OK(statuses[5]);
+  ASSERT_EQ(values[5].ToString(), "val99");
+  ASSERT_TRUE(statuses[6].IsNotFound());  // never inserted
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupOverwrite) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Insert, then overwrite some keys
+  for (int i = 0; i < 50; i++) {
+    ASSERT_OK(Put(1, Key(i), "old" + std::to_string(i)));
+  }
+  for (int i = 0; i < 50; i += 5) {
+    ASSERT_OK(Put(1, Key(i), "new" + std::to_string(i)));
+  }
+
+  std::vector<std::string> key_strs;
+  for (int i = 0; i < 50; i += 5) {
+    key_strs.push_back(Key(i));
+  }
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  for (size_t i = 0; i < keys.size(); i++) {
+    ASSERT_OK(statuses[i]);
+    ASSERT_EQ(values[i].ToString(), "new" + std::to_string(i * 5));
+  }
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupWithFlush) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Put data into SST
+  for (int i = 0; i < 50; i++) {
+    ASSERT_OK(Put(1, Key(i), "sst" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush(1));
+
+  // Put different data into memtable (overlapping some keys)
+  for (int i = 25; i < 75; i++) {
+    ASSERT_OK(Put(1, Key(i), "mem" + std::to_string(i)));
+  }
+
+  // MultiGet keys spanning both SST and memtable
+  std::vector<std::string> key_strs = {Key(10), Key(30), Key(60), Key(80)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "sst10");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "mem30");
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2].ToString(), "mem60");
+  ASSERT_TRUE(statuses[3].IsNotFound());
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupWithMerge) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Put base values
+  ASSERT_OK(Put(1, Key(1), "a"));
+  ASSERT_OK(Put(1, Key(2), "x"));
+  // Merge on top
+  ASSERT_OK(Merge(1, Key(1), "b"));
+  ASSERT_OK(Merge(1, Key(1), "c"));
+  ASSERT_OK(Merge(1, Key(2), "y"));
+
+  std::vector<std::string> key_strs = {Key(1), Key(2), Key(3)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "a,b,c");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "x,y");
+  ASSERT_TRUE(statuses[2].IsNotFound());
+}
+
+TEST_F(DBBasicTest, MultiGetBatchLookupDisabledByDefault) {
+  // Verify that finger search is off by default and MultiGet still works
+  Options options = CurrentOptions();
+  ASSERT_FALSE(options.memtable_batch_lookup_optimization);
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  ASSERT_OK(Put(1, "k1", "v1"));
+  ASSERT_OK(Put(1, "k2", "v2"));
+
+  std::vector<Slice> keys = {"k1", "k2", "k3"};
+  std::vector<PinnableSlice> values(3);
+  std::vector<Status> statuses(3);
+
+  db_->MultiGet(ReadOptions(), handles_[1], 3, keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "v1");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "v2");
+  ASSERT_TRUE(statuses[2].IsNotFound());
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupWithParanoid) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  options.paranoid_memory_checks = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  // Insert sorted keys into memtable
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(1, Key(i), "val" + std::to_string(i)));
+  }
+  ASSERT_OK(Delete(1, Key(25)));
+
+  // MultiGet with both batch optimization and paranoid checks enabled
+  std::vector<std::string> key_strs = {Key(0),  Key(10), Key(25),
+                                       Key(50), Key(99), Key(200)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "val0");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "val10");
+  ASSERT_TRUE(statuses[2].IsNotFound());  // deleted
+  ASSERT_OK(statuses[3]);
+  ASSERT_EQ(values[3].ToString(), "val50");
+  ASSERT_OK(statuses[4]);
+  ASSERT_EQ(values[4].ToString(), "val99");
+  ASSERT_TRUE(statuses[5].IsNotFound());  // never inserted
+}
+
+TEST_P(DBMultiGetTestWithParam, MultiGetBatchLookupSnapshot) {
+#ifndef USE_COROUTINES
+  if (std::get<1>(GetParam())) {
+    ROCKSDB_GTEST_SKIP("This test requires coroutine support");
+    return;
+  }
+#endif  // USE_COROUTINES
+  if (!std::get<0>(GetParam())) {
+    ROCKSDB_GTEST_BYPASS("This test is only for batched MultiGet");
+    return;
+  }
+  Options options = CurrentOptions();
+  options.memtable_batch_lookup_optimization = true;
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  ASSERT_OK(Put(1, Key(1), "v1_old"));
+  ASSERT_OK(Put(1, Key(2), "v2_old"));
+
+  const Snapshot* snap = db_->GetSnapshot();
+
+  // Write new values after snapshot
+  ASSERT_OK(Put(1, Key(1), "v1_new"));
+  ASSERT_OK(Put(1, Key(2), "v2_new"));
+  ASSERT_OK(Put(1, Key(3), "v3_new"));
+
+  // MultiGet with snapshot should see old values
+  std::vector<std::string> key_strs = {Key(1), Key(2), Key(3)};
+  std::vector<Slice> keys(key_strs.begin(), key_strs.end());
+
+  std::vector<PinnableSlice> values(keys.size());
+  std::vector<Status> statuses(keys.size());
+
+  ReadOptions ro;
+  ro.snapshot = snap;
+  ro.async_io = std::get<1>(GetParam());
+  db_->MultiGet(ro, handles_[1], keys.size(), keys.data(), values.data(),
+                statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "v1_old");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "v2_old");
+  ASSERT_TRUE(statuses[2].IsNotFound());  // didn't exist at snapshot
+
+  db_->ReleaseSnapshot(snap);
+
+  // MultiGet without snapshot should see new values
+  for (auto& v : values) {
+    v.Reset();
+  }
+  db_->MultiGet(ReadOptions(), handles_[1], keys.size(), keys.data(),
+                values.data(), statuses.data(), true);
+
+  ASSERT_OK(statuses[0]);
+  ASSERT_EQ(values[0].ToString(), "v1_new");
+  ASSERT_OK(statuses[1]);
+  ASSERT_EQ(values[1].ToString(), "v2_new");
+  ASSERT_OK(statuses[2]);
+  ASSERT_EQ(values[2].ToString(), "v3_new");
+}
+
 INSTANTIATE_TEST_CASE_P(DBMultiGetTestWithParam, DBMultiGetTestWithParam,
                         testing::Combine(testing::Bool(), testing::Bool()));
 
@@ -3301,8 +3607,8 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
     ASSERT_OK(Delete(std::to_string(i)));
   }
   std::vector<KeyVersion> key_versions;
-  ASSERT_OK(GetAllKeyVersions(db_, {}, {}, std::numeric_limits<size_t>::max(),
-                              &key_versions));
+  ASSERT_OK(GetAllKeyVersions(
+      db_.get(), {}, {}, std::numeric_limits<size_t>::max(), &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates, key_versions.size());
   for (size_t i = 0; i < kNumInserts + kNumDeletes + kNumUpdates; i++) {
     if (i % 3 == 0) {
@@ -3311,7 +3617,7 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
       ASSERT_EQ(key_versions[i].GetTypeName(), "TypeValue");
     }
   }
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[0], {}, {},
+  ASSERT_OK(GetAllKeyVersions(db_.get(), handles_[0], {}, {},
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates, key_versions.size());
@@ -3326,14 +3632,14 @@ TEST_F(DBBasicTest, GetAllKeyVersions) {
   for (size_t i = 0; i + 1 != kNumDeletes; ++i) {
     ASSERT_OK(Delete(1, std::to_string(i)));
   }
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[1], {}, {},
+  ASSERT_OK(GetAllKeyVersions(db_.get(), handles_[1], {}, {},
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(kNumInserts + kNumDeletes + kNumUpdates - 3, key_versions.size());
 
   // Change from historical behavior: empty key is now interpreted literally as
   // a legal key (rather than as a "not present" key)
-  ASSERT_OK(GetAllKeyVersions(db_, handles_[1], Slice(), Slice(),
+  ASSERT_OK(GetAllKeyVersions(db_.get(), handles_[1], Slice(), Slice(),
                               std::numeric_limits<size_t>::max(),
                               &key_versions));
   ASSERT_EQ(key_versions.size(), 0);

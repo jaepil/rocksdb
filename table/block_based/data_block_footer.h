@@ -26,7 +26,19 @@ namespace ROCKSDB_NAMESPACE {
 //   - The low 28 bits store the number of restart points (num_restarts)
 //   - The high 4 bits are reserved for metadata/features:
 //     - Bit 31: Hash index present (kDataBlockBinaryAndHash)
-//     - Bits 28-30: Reserved for future features
+//     - Bit 30: IMPORTANT: Cannot be used without format version bump.
+//     - Bit 29: Uniform keys flag (for kAuto index block search)
+//     - Bit 28: Separated KV storage (keys and values stored in separate
+//       sections within the block)
+//
+// Note on forward compatibility: Bits 28-29 can be read by older versions of
+// RocksDB and interpreted as an extremely large, which will be caught as a
+// corruption. Bit 30 is special because num_restarts is multipled by 4, causing
+// overflow and the corruption check to be silently ignored
+// (https://github.com/facebook/rocksdb/blob/10.11.fb/table/block_based/block.cc#L1070-L1103)
+//
+// When separated KV is enabled, an additional uint32_t is prepended before the
+// packed footer, storing the offset to the values section within the block.
 //
 // When any unrecognized reserved bit is set, DecodeFrom() returns an error,
 // allowing older versions to fail gracefully on newer formats.
@@ -43,16 +55,25 @@ struct DataBlockFooter {
   // per restart, fits at most (2^32 - 4) / 16 ≈ 268 million restarts.
   static constexpr uint32_t kMaxNumRestarts = (1u << 28) - 1;
 
-  // Maximum encoded length of a DataBlockFooter (for buffer sizing)
-  // Currently 4 bytes, but may grow in future format versions.
-  static constexpr uint32_t kMaxEncodedLength = sizeof(uint32_t);
+  // Maximum encoded length of a DataBlockFooter (for buffer sizing).
+  // 8 bytes when separated KV is enabled (values_section_offset + packed),
+  // 4 bytes otherwise.
+  static constexpr uint32_t kMaxEncodedLength = 2 * sizeof(uint32_t);
 
   // Minimum encoded length (for current format version)
   static constexpr uint32_t kMinEncodedLength = sizeof(uint32_t);
 
   BlockBasedTableOptions::DataBlockIndexType index_type =
       BlockBasedTableOptions::kDataBlockBinarySearch;
+
+  // Whether the block uses separated KV storage (keys and values in separate
+  // sections). When true, values_section_offset indicates where the values
+  // section begins within the block data.
+  bool separated_kv = false;
+  uint32_t values_section_offset = 0;
+
   uint32_t num_restarts = 0;
+  bool is_uniform = false;
 
   DataBlockFooter() = default;
   DataBlockFooter(BlockBasedTableOptions::DataBlockIndexType _index_type,

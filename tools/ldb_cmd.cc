@@ -88,6 +88,7 @@ const std::string LDBCommand::ARG_COMPRESSION_TYPE = "compression_type";
 const std::string LDBCommand::ARG_COMPRESSION_MAX_DICT_BYTES =
     "compression_max_dict_bytes";
 const std::string LDBCommand::ARG_BLOCK_SIZE = "block_size";
+const std::string LDBCommand::ARG_UNIFORM_CV_THRESHOLD = "uniform_cv_threshold";
 const std::string LDBCommand::ARG_AUTO_COMPACTION = "auto_compaction";
 const std::string LDBCommand::ARG_DB_WRITE_BUFFER_SIZE = "db_write_buffer_size";
 const std::string LDBCommand::ARG_WRITE_BUFFER_SIZE = "write_buffer_size";
@@ -112,6 +113,8 @@ const std::string LDBCommand::ARG_BLOB_FILE_STARTING_LEVEL =
 const std::string LDBCommand::ARG_PREPOPULATE_BLOB_CACHE =
     "prepopulate_blob_cache";
 const std::string LDBCommand::ARG_DECODE_BLOB_INDEX = "decode_blob_index";
+const std::string LDBCommand::ARG_DUMP_UNCOMPRESSED_BLOBS =
+    "dump_uncompressed_blobs";
 const std::string LDBCommand::ARG_READ_TIMESTAMP = "read_timestamp";
 const std::string LDBCommand::ARG_GET_WRITE_UNIX_TIME = "get_write_unix_time";
 
@@ -201,7 +204,7 @@ void DumpSstFile(Options options, std::string filename, bool output_hex,
                  std::string from_key = "", std::string to_key = "");
 
 void DumpBlobFile(const std::string& filename, bool is_key_hex,
-                  bool is_value_hex);
+                  bool is_value_hex, bool dump_uncompressed_blobs);
 
 Status EncodeUserProvidedTimestamp(const std::string& user_timestamp,
                                    std::string* ts_buf);
@@ -595,7 +598,7 @@ void LDBCommand::OpenDB() {
       st = TransactionDB::Open(options_, txn_db_options, db_path_,
                                column_families_, &handles_opened, &db_txn_);
     }
-    db_ = db_txn_;
+    db_.reset(db_txn_);
   } else if (is_db_ttl_) {
     // ldb doesn't yet support TTL DB with multiple column families
     if (!column_family_name_.empty() || !column_families_.empty()) {
@@ -611,7 +614,7 @@ void LDBCommand::OpenDB() {
     } else {
       st = DBWithTTL::Open(options_, db_path_, &db_ttl_);
     }
-    db_ = db_ttl_;
+    db_.reset(db_ttl_);
   } else {
     if (!secondary_path_.empty() && !leader_path_.empty()) {
       exec_state_ = LDBCommandExecuteResult::Failed(
@@ -631,9 +634,7 @@ void LDBCommand::OpenDB() {
         } else if (!secondary_path_.empty()) {
           st = DB::OpenAsSecondary(options_, db_path_, secondary_path_, &db_);
         } else {
-          std::unique_ptr<DB> dbptr;
-          st = DB::OpenAsFollower(options_, db_path_, leader_path_, &dbptr);
-          db_ = dbptr.release();
+          st = DB::OpenAsFollower(options_, db_path_, leader_path_, &db_);
         }
       } else {
         if (secondary_path_.empty() && leader_path_.empty()) {
@@ -643,10 +644,8 @@ void LDBCommand::OpenDB() {
           st = DB::OpenAsSecondary(options_, db_path_, secondary_path_,
                                    column_families_, &handles_opened, &db_);
         } else {
-          std::unique_ptr<DB> dbptr;
           st = DB::OpenAsFollower(options_, db_path_, leader_path_,
-                                  column_families_, &handles_opened, &dbptr);
-          db_ = dbptr.release();
+                                  column_families_, &handles_opened, &db_);
         }
       }
     }
@@ -691,8 +690,9 @@ void LDBCommand::CloseDB() {
     }
     Status s = db_->Close();
     s.PermitUncheckedError();
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
+    db_ttl_ = nullptr;
+    db_txn_ = nullptr;
   }
 }
 
@@ -718,6 +718,7 @@ std::vector<std::string> LDBCommand::BuildCmdLineOptions(
                                   ARG_LEADER_PATH,
                                   ARG_BLOOM_BITS,
                                   ARG_BLOCK_SIZE,
+                                  ARG_UNIFORM_CV_THRESHOLD,
                                   ARG_AUTO_COMPACTION,
                                   ARG_COMPRESSION_TYPE,
                                   ARG_COMPRESSION_MAX_DICT_BYTES,
@@ -1028,6 +1029,13 @@ void LDBCommand::OverrideBaseCFOptions(ColumnFamilyOptions* cf_opts) {
       exec_state_ =
           LDBCommandExecuteResult::Failed(ARG_BLOCK_SIZE + " must be > 0.");
     }
+  }
+
+  double uniform_cv_threshold;
+  if (ParseDoubleOption(option_map_, ARG_UNIFORM_CV_THRESHOLD,
+                        uniform_cv_threshold, exec_state_)) {
+    use_table_options = true;
+    table_options.uniform_cv_threshold = uniform_cv_threshold;
   }
 
   // Default comparator is BytewiseComparator, so only when it's not, it
@@ -2227,9 +2235,9 @@ void InternalDumpCommand::DoCommand() {
 
   // Cast as DBImpl to get internal iterator
   std::vector<KeyVersion> key_versions;
-  Status st =
-      GetAllKeyVersions(db_, GetCfHandle(), has_from_ ? from_ : OptSlice{},
-                        has_to_ ? to_ : OptSlice{}, max_keys_, &key_versions);
+  Status st = GetAllKeyVersions(
+      db_.get(), GetCfHandle(), has_from_ ? from_ : OptSlice{},
+      has_to_ ? to_ : OptSlice{}, max_keys_, &key_versions);
   if (!st.ok()) {
     exec_state_ = LDBCommandExecuteResult::Failed(st.ToString());
     return;
@@ -2335,19 +2343,21 @@ DBDumperCommand::DBDumperCommand(
     const std::vector<std::string>& /*params*/,
     const std::map<std::string, std::string>& options,
     const std::vector<std::string>& flags)
-    : LDBCommand(options, flags, true /* is_read_only */,
-                 BuildCmdLineOptions(
-                     {ARG_TTL, ARG_HEX, ARG_KEY_HEX, ARG_VALUE_HEX, ARG_FROM,
-                      ARG_TO, ARG_MAX_KEYS, ARG_COUNT_ONLY, ARG_COUNT_DELIM,
-                      ARG_STATS, ARG_TTL_START, ARG_TTL_END, ARG_TTL_BUCKET,
-                      ARG_TIMESTAMP, ARG_PATH, ARG_DECODE_BLOB_INDEX})),
+    : LDBCommand(
+          options, flags, true /* is_read_only */,
+          BuildCmdLineOptions(
+              {ARG_TTL, ARG_HEX, ARG_KEY_HEX, ARG_VALUE_HEX, ARG_FROM, ARG_TO,
+               ARG_MAX_KEYS, ARG_COUNT_ONLY, ARG_COUNT_DELIM, ARG_STATS,
+               ARG_TTL_START, ARG_TTL_END, ARG_TTL_BUCKET, ARG_TIMESTAMP,
+               ARG_PATH, ARG_DECODE_BLOB_INDEX, ARG_DUMP_UNCOMPRESSED_BLOBS})),
       null_from_(true),
       null_to_(true),
       max_keys_(-1),
       count_only_(false),
       count_delim_(false),
       print_stats_(false),
-      decode_blob_index_(false) {
+      decode_blob_index_(false),
+      dump_uncompressed_blobs_(false) {
   auto itr = options.find(ARG_FROM);
   if (itr != options.end()) {
     null_from_ = false;
@@ -2388,6 +2398,7 @@ DBDumperCommand::DBDumperCommand(
   print_stats_ = IsFlagPresent(flags, ARG_STATS);
   count_only_ = IsFlagPresent(flags, ARG_COUNT_ONLY);
   decode_blob_index_ = IsFlagPresent(flags, ARG_DECODE_BLOB_INDEX);
+  dump_uncompressed_blobs_ = IsFlagPresent(flags, ARG_DUMP_UNCOMPRESSED_BLOBS);
 
   if (is_key_hex_) {
     if (!null_from_) {
@@ -2422,6 +2433,7 @@ void DBDumperCommand::Help(std::string& ret) {
   ret.append(" [--" + ARG_TTL_END + "=<N>:- is exclusive]");
   ret.append(" [--" + ARG_PATH + "=<path_to_a_file>]");
   ret.append(" [--" + ARG_DECODE_BLOB_INDEX + "]");
+  ret.append(" [--" + ARG_DUMP_UNCOMPRESSED_BLOBS + "]");
   ret.append("\n");
 }
 
@@ -2468,7 +2480,8 @@ void DBDumperCommand::DoCommand() {
                          /*  json_ */ false, column_families_);
         break;
       case kBlobFile:
-        DumpBlobFile(path_, is_key_hex_, is_value_hex_);
+        DumpBlobFile(path_, is_key_hex_, is_value_hex_,
+                     dump_uncompressed_blobs_);
         break;
       default:
         exec_state_ = LDBCommandExecuteResult::Failed(
@@ -2624,6 +2637,13 @@ void DBDumperCommand::DoDumpCommand() {
                     ucmp);
       fprintf(stdout, "%s\n", str.c_str());
     }
+  }
+
+  // Check for iterator errors that may have occurred during iteration
+  st = iter->status();
+  if (!st.ok()) {
+    exec_state_ =
+        LDBCommandExecuteResult::Failed("Iterator error: " + st.ToString());
   }
 
   if (num_buckets > 1 && is_db_ttl_) {
@@ -4501,7 +4521,7 @@ void CheckPointCommand::DoCommand() {
     return;
   }
   Checkpoint* checkpoint;
-  Status status = Checkpoint::Create(db_, &checkpoint);
+  Status status = Checkpoint::Create(db_.get(), &checkpoint);
   status = checkpoint->CreateCheckpoint(checkpoint_dir_);
   if (status.ok()) {
     fprintf(stdout, "OK\n");
@@ -4656,7 +4676,7 @@ void BackupCommand::DoCommand() {
     exec_state_ = LDBCommandExecuteResult::Failed(status.ToString());
     return;
   }
-  status = backup_engine->CreateNewBackup(db_);
+  status = backup_engine->CreateNewBackup(db_.get());
   if (status.ok()) {
     fprintf(stdout, "create new backup OK\n");
   } else {
@@ -4761,16 +4781,21 @@ void DumpSstFile(Options options, std::string filename, bool output_hex,
 }
 
 void DumpBlobFile(const std::string& filename, bool is_key_hex,
-                  bool is_value_hex) {
+                  bool is_value_hex, bool dump_uncompressed_blobs) {
   using ROCKSDB_NAMESPACE::blob_db::BlobDumpTool;
   BlobDumpTool tool;
-  BlobDumpTool::DisplayType show_blob = is_value_hex
+  BlobDumpTool::DisplayType blob_type = is_value_hex
                                             ? BlobDumpTool::DisplayType::kHex
                                             : BlobDumpTool::DisplayType::kRaw;
+  BlobDumpTool::DisplayType show_uncompressed_blob =
+      dump_uncompressed_blobs ? blob_type : BlobDumpTool::DisplayType::kNone;
+  BlobDumpTool::DisplayType show_blob =
+      dump_uncompressed_blobs ? BlobDumpTool::DisplayType::kNone : blob_type;
   BlobDumpTool::DisplayType show_key = is_key_hex
                                            ? BlobDumpTool::DisplayType::kHex
                                            : BlobDumpTool::DisplayType::kRaw;
-  Status s = tool.Run(filename, show_key, show_blob, /* show_summary */ true);
+  Status s = tool.Run(filename, show_key, show_blob, show_uncompressed_blob,
+                      /* show_summary */ true);
   if (!s.ok()) {
     fprintf(stderr, "Failed: %s\n", s.ToString().c_str());
   }
@@ -4794,13 +4819,17 @@ DBFileDumperCommand::DBFileDumperCommand(
     const std::map<std::string, std::string>& options,
     const std::vector<std::string>& flags)
     : LDBCommand(options, flags, true /* is_read_only */,
-                 BuildCmdLineOptions({ARG_DECODE_BLOB_INDEX})),
-      decode_blob_index_(IsFlagPresent(flags, ARG_DECODE_BLOB_INDEX)) {}
+                 BuildCmdLineOptions(
+                     {ARG_DECODE_BLOB_INDEX, ARG_DUMP_UNCOMPRESSED_BLOBS})),
+      decode_blob_index_(IsFlagPresent(flags, ARG_DECODE_BLOB_INDEX)),
+      dump_uncompressed_blobs_(
+          IsFlagPresent(flags, ARG_DUMP_UNCOMPRESSED_BLOBS)) {}
 
 void DBFileDumperCommand::Help(std::string& ret) {
   ret.append("  ");
   ret.append(DBFileDumperCommand::Name());
   ret.append(" [--" + ARG_DECODE_BLOB_INDEX + "]");
+  ret.append(" [--" + ARG_DUMP_UNCOMPRESSED_BLOBS + "]");
   ret.append("\n");
 }
 
@@ -4868,7 +4897,8 @@ void DBFileDumperCommand::DoCommand() {
       filename = NormalizePath(filename);
       std::cout << filename << std::endl;
       std::cout << "------------------------------" << std::endl;
-      DumpBlobFile(filename, /* is_key_hex */ false, /* is_value_hex */ false);
+      DumpBlobFile(filename, /* is_key_hex */ false, /* is_value_hex */ false,
+                   dump_uncompressed_blobs_);
       std::cout << std::endl;
     }
   }

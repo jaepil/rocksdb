@@ -472,7 +472,7 @@ Status DBImpl::ResumeImpl(DBRecoverContext context) {
 void DBImpl::WaitForBackgroundWork() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
-         bg_flush_scheduled_) {
+         bg_flush_scheduled_ || bg_pressure_callback_in_progress_) {
     bg_cv_.Wait();
   }
 }
@@ -561,11 +561,18 @@ Status DBImpl::CloseHelper() {
   // Wait for background work to finish
   while (bg_bottom_compaction_scheduled_ || bg_compaction_scheduled_ ||
          bg_flush_scheduled_ || bg_purge_scheduled_ ||
+         bg_pressure_callback_in_progress_ ||
+         bg_async_file_open_state_ == AsyncFileOpenState::kScheduled ||
          pending_purge_obsolete_files_ ||
          error_handler_.IsRecoveryInProgress()) {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
     bg_cv_.Wait();
   }
+
+  // Ensure subclasses don't forget to schedule async file opening
+  assert(!immutable_db_options_.open_files_async || !opened_successfully_ ||
+         bg_async_file_open_state_ != AsyncFileOpenState::kNotScheduled);
+
   TEST_SYNC_POINT_CALLBACK("DBImpl::CloseHelper:PendingPurgeFinished",
                            &files_grabbed_for_purge_);
   EraseThreadStatusDbInfo();
@@ -784,7 +791,77 @@ void DBImpl::PrintStatistics() {
   }
 }
 
+// Computes the minimum time-based compaction interval for a CF based on
+// various options.
+// Returns 0 if all time-based compaction options are disabled.
+static uint64_t GetMinTimeBasedCompactionInterval(
+    const ColumnFamilyOptions& cf_opts) {
+  uint64_t min_interval = UINT64_MAX;
+  if (cf_opts.periodic_compaction_seconds > 0) {
+    min_interval = std::min(min_interval, cf_opts.periodic_compaction_seconds);
+  }
+  if (cf_opts.ttl > 0) {
+    min_interval = std::min(min_interval, cf_opts.ttl);
+  }
+  const auto& fifo_thresholds =
+      cf_opts.compaction_options_fifo.file_temperature_age_thresholds;
+  if (!fifo_thresholds.empty() && fifo_thresholds[0].age > 0) {
+    // Thresholds are in increasing order by age, so first is smallest
+    min_interval = std::min(min_interval, fifo_thresholds[0].age);
+  }
+  if (cf_opts.bottommost_file_compaction_delay > 0) {
+    // NOTE: 0 does not exactly mean "disabled" in this case but it does mean
+    // there's no time component to the relevant compaction picking.
+    min_interval = std::min(min_interval,
+                            uint64_t{cf_opts.bottommost_file_compaction_delay});
+  }
+  // Note: Assume sentinel values like UINT64_MAX - 1 (used by ttl and
+  // periodic_compaction_seconds) are like disabling, if they reach here
+  // unsanitized.
+  return min_interval > UINT64_MAX / 2 ? 0 : min_interval;
+}
+
+uint64_t DBImpl::ComputeTriggerCompactionPeriod() {
+  // Start with the configured maximum, then reduce based on other options.
+  uint64_t period_sec =
+      mutable_db_options_.max_compaction_trigger_wakeup_seconds;
+
+  // Consider DB-level options that have the DB waking up periodically anyway.
+  // Waking up to check for compactions at the same interval should be no
+  // problem, as it should be less overhead than these.
+  if (mutable_db_options_.stats_dump_period_sec > 0) {
+    period_sec = std::min(period_sec,
+                          (uint64_t)mutable_db_options_.stats_dump_period_sec);
+  }
+  if (mutable_db_options_.stats_persist_period_sec > 0) {
+    period_sec = std::min(
+        period_sec, (uint64_t)mutable_db_options_.stats_persist_period_sec);
+  }
+
+  // Consider per-CF settings that can trigger compaction based on time.
+  uint64_t compaction_trigger_sec = UINT64_MAX;
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    uint64_t cf_min =
+        GetMinTimeBasedCompactionInterval(cfd->GetLatestCFOptions());
+    if (cf_min > 0) {
+      compaction_trigger_sec = std::min(compaction_trigger_sec, cf_min);
+    }
+  }
+  // We might not align with those timings perfectly, so we tolerate only some
+  // proportional delay, up to 1/kTriggerDivisor ~= 20%.
+  constexpr uint64_t kTriggerDivisor = 5;
+  period_sec = std::min(period_sec, compaction_trigger_sec / kTriggerDivisor);
+  // But must be > 0
+  period_sec = std::max(period_sec, uint64_t{1});
+
+  return period_sec;
+}
+
 Status DBImpl::StartPeriodicTaskScheduler() {
+  Status s;
 #ifndef NDEBUG
   // It only used by test to disable scheduler
   bool disable_scheduler = false;
@@ -792,7 +869,7 @@ Status DBImpl::StartPeriodicTaskScheduler() {
       "DBImpl::StartPeriodicTaskScheduler:DisableScheduler",
       &disable_scheduler);
   if (disable_scheduler) {
-    return Status::OK();
+    return s;
   }
 
   {
@@ -803,7 +880,7 @@ Status DBImpl::StartPeriodicTaskScheduler() {
 
 #endif  // !NDEBUG
   if (mutable_db_options_.stats_dump_period_sec > 0) {
-    Status s = periodic_task_scheduler_.Register(
+    s = periodic_task_scheduler_.Register(
         PeriodicTaskType::kDumpStats,
         periodic_task_functions_.at(PeriodicTaskType::kDumpStats),
         mutable_db_options_.stats_dump_period_sec,
@@ -813,7 +890,7 @@ Status DBImpl::StartPeriodicTaskScheduler() {
     }
   }
   if (mutable_db_options_.stats_persist_period_sec > 0) {
-    Status s = periodic_task_scheduler_.Register(
+    s = periodic_task_scheduler_.Register(
         PeriodicTaskType::kPersistStats,
         periodic_task_functions_.at(PeriodicTaskType::kPersistStats),
         mutable_db_options_.stats_persist_period_sec,
@@ -823,17 +900,18 @@ Status DBImpl::StartPeriodicTaskScheduler() {
     }
   }
 
-  Status s = periodic_task_scheduler_.Register(
+  s = periodic_task_scheduler_.Register(
       PeriodicTaskType::kFlushInfoLog,
       periodic_task_functions_.at(PeriodicTaskType::kFlushInfoLog),
       /*run_immediately=*/true);
-
-  if (s.ok()) {
-    s = periodic_task_scheduler_.Register(
-        PeriodicTaskType::kTriggerCompaction,
-        periodic_task_functions_.at(PeriodicTaskType::kTriggerCompaction),
-        /*run_immediately=*/false);
+  if (!s.ok()) {
+    return s;
   }
+
+  s = periodic_task_scheduler_.Register(
+      PeriodicTaskType::kTriggerCompaction,
+      periodic_task_functions_.at(PeriodicTaskType::kTriggerCompaction),
+      ComputeTriggerCompactionPeriod(), /*run_immediately=*/false);
 
   return s;
 }
@@ -1471,6 +1549,13 @@ Status DBImpl::SetDBOptions(
       table_cache_.get()->SetCapacity(new_options.max_open_files == -1
                                           ? TableCache::kInfiniteCapacity
                                           : new_options.max_open_files - 10);
+      // Potential table cache capacity change requires updating if table
+      // handles should get pinned.
+      for (auto cfd : *versions_->GetColumnFamilySet()) {
+        if (!cfd->IsDropped()) {
+          cfd->table_cache()->UpdateShouldPinTableHandles();
+        }
+      }
       wal_other_option_changed = mutable_db_options_.wal_bytes_per_sync !=
                                  new_options.wal_bytes_per_sync;
       wal_size_option_changed = mutable_db_options_.max_total_wal_size !=
@@ -3925,10 +4010,6 @@ Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
     read_options.io_activity = Env::IOActivity::kDBIterator;
   }
 
-  if (read_options.managed) {
-    return NewErrorIterator(
-        Status::NotSupported("Managed iterator is not supported anymore."));
-  }
   Iterator* result = nullptr;
   if (read_options.read_tier == kPersistedTier) {
     return NewErrorIterator(Status::NotSupported(
@@ -4127,9 +4208,6 @@ Status DBImpl::NewIterators(
   ReadOptions read_options(_read_options);
   if (read_options.io_activity == Env::IOActivity::kUnknown) {
     read_options.io_activity = Env::IOActivity::kDBIterator;
-  }
-  if (read_options.managed) {
-    return Status::NotSupported("Managed iterator is not supported anymore.");
   }
   if (read_options.read_tier == kPersistedTier) {
     return Status::NotSupported(
@@ -4875,7 +4953,8 @@ void DBImpl::GetApproximateMemTableStats(ColumnFamilyHandle* column_family,
 Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
                                    ColumnFamilyHandle* column_family,
                                    const Range* range, int n, uint64_t* sizes) {
-  if (!options.include_memtables && !options.include_files) {
+  if (!options.include_memtables && !options.include_files &&
+      !options.include_blob_files) {
     return Status::InvalidArgument("Invalid options");
   }
 
@@ -4891,6 +4970,28 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
   const ReadOptions read_options;
+
+  // Pre-compute blob-to-SST ratio once (invariant across ranges for the same
+  // Version). This avoids iterating all levels and blob files per range.
+  double blob_to_sst_ratio = 0.0;
+  if (options.include_blob_files) {
+    const auto* vstorage = v->storage_info();
+    uint64_t total_sst_size = 0;
+    for (int level = 0; level < vstorage->num_non_empty_levels(); ++level) {
+      total_sst_size += vstorage->NumLevelBytes(level);
+    }
+    if (total_sst_size > 0) {
+      uint64_t total_blob_size = 0;
+      const auto& blob_files = vstorage->GetBlobFiles();
+      for (const auto& blob_file_meta : blob_files) {
+        assert(blob_file_meta);
+        total_blob_size += blob_file_meta->GetBlobFileSize();
+      }
+      blob_to_sst_ratio = static_cast<double>(total_blob_size) /
+                          static_cast<double>(total_sst_size);
+    }
+  }
+
   for (int i = 0; i < n; i++) {
     // Add timestamp if needed
     std::string start_with_ts, limit_with_ts;
@@ -4902,15 +5003,25 @@ Status DBImpl::GetApproximateSizes(const SizeApproximationOptions& options,
     InternalKey k1(start.value(), kMaxSequenceNumber, kValueTypeForSeek);
     InternalKey k2(limit.value(), kMaxSequenceNumber, kValueTypeForSeek);
     sizes[i] = 0;
-    if (options.include_files) {
-      sizes[i] += versions_->ApproximateSize(
+    // Compute SST size in range (needed for both include_files and
+    // include_blob_files, since blob size is prorated by SST ratio).
+    uint64_t sst_size_in_range = 0;
+    if (options.include_files || options.include_blob_files) {
+      sst_size_in_range = versions_->ApproximateSize(
           options, read_options, v, k1.Encode(), k2.Encode(),
           /*start_level=*/0,
           /*end_level=*/-1, TableReaderCaller::kUserApproximateSize);
     }
+    if (options.include_files) {
+      sizes[i] += sst_size_in_range;
+    }
     if (options.include_memtables) {
       sizes[i] += sv->mem->ApproximateStats(k1.Encode(), k2.Encode()).size;
       sizes[i] += sv->imm->ApproximateStats(k1.Encode(), k2.Encode()).size;
+    }
+    if (options.include_blob_files) {
+      sizes[i] += static_cast<uint64_t>(static_cast<double>(sst_size_in_range) *
+                                        blob_to_sst_ratio);
     }
   }
 
@@ -6923,8 +7034,18 @@ void DBImpl::TriggerPeriodicCompaction() {
       if (cfd->IsDropped()) {
         continue;
       }
-      if (cfd->GetLatestCFOptions().periodic_compaction_seconds &&
-          !cfd->queued_for_compaction()) {
+      if (cfd->queued_for_compaction()) {
+        continue;
+      }
+      // Check if this CF has any time-based or read-triggered compaction
+      // configured. This includes periodic_compaction_seconds, ttl, FIFO
+      // temperature thresholds, or read_triggered_compaction_threshold.
+      if (GetMinTimeBasedCompactionInterval(cfd->GetLatestCFOptions()) > 0 ||
+          cfd->GetLatestMutableCFOptions().read_triggered_compaction_threshold >
+              0.0) {
+        TEST_SYNC_POINT_CALLBACK(
+            "DBImpl::TriggerPeriodicCompaction:BeforeComputeCompactionScore",
+            cfd);
         cfd->current()->storage_info()->ComputeCompactionScore(
             cfd->ioptions(), cfd->GetLatestMutableCFOptions(),
             cfd->GetFullHistoryTsLow());

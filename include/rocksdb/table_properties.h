@@ -50,6 +50,7 @@ struct TablePropertiesNames {
   static const std::string kRawKeySize;
   static const std::string kRawValueSize;
   static const std::string kNumDataBlocks;
+  static const std::string kNumUniformBlocks;
   static const std::string kNumEntries;
   static const std::string kNumFilterEntries;
   static const std::string kDeletedKeys;
@@ -77,6 +78,9 @@ struct TablePropertiesNames {
   static const std::string kUserDefinedTimestampsPersisted;
   static const std::string kKeyLargestSeqno;
   static const std::string kKeySmallestSeqno;
+  static const std::string kDataBlockRestartInterval;
+  static const std::string kIndexBlockRestartInterval;
+  static const std::string kSeparateKeyValueInDataBlock;
 };
 
 // `TablePropertiesCollector` provides the mechanism for users to collect
@@ -242,6 +246,8 @@ struct TableProperties {
   uint64_t raw_value_size = 0;
   // the number of blocks in this table
   uint64_t num_data_blocks = 0;
+  // the number of uniform blocks in this table
+  uint64_t num_uniform_blocks = 0;
   // the number of entries in this table
   uint64_t num_entries = 0;
   // the number of unique entries (keys or prefixes) added to filters
@@ -319,6 +325,18 @@ struct TableProperties {
   uint64_t key_smallest_seqno = UINT64_MAX;
 
   bool HasKeySmallestSeqno() const { return key_smallest_seqno != UINT64_MAX; }
+
+  // Block restart intervals used when building this SST file.
+  // 0 means unknown (for backwards compatibility with older SST files).
+  uint64_t data_block_restart_interval = 0;
+  uint64_t index_block_restart_interval = 0;
+
+  // Whether the SST file uses separated key/value storage in data blocks (0 =
+  // false). The block footer stores the real source of truth of whether the
+  // block has separated key values, but this table property is useful for
+  // debugging/validation purposes. Consider removing this if we ever decide to
+  // mix separation strategies for a sst.
+  uint64_t separate_key_value_in_data_block = 0;
 
   // DB identity
   // db_id is an identifier generated the first time the DB is created

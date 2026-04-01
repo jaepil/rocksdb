@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -56,6 +57,7 @@ class LDBCommand {
   static const std::string ARG_COMPRESSION_TYPE;
   static const std::string ARG_COMPRESSION_MAX_DICT_BYTES;
   static const std::string ARG_BLOCK_SIZE;
+  static const std::string ARG_UNIFORM_CV_THRESHOLD;
   static const std::string ARG_AUTO_COMPACTION;
   static const std::string ARG_DB_WRITE_BUFFER_SIZE;
   static const std::string ARG_WRITE_BUFFER_SIZE;
@@ -74,6 +76,7 @@ class LDBCommand {
   static const std::string ARG_BLOB_FILE_STARTING_LEVEL;
   static const std::string ARG_PREPOPULATE_BLOB_CACHE;
   static const std::string ARG_DECODE_BLOB_INDEX;
+  static const std::string ARG_DUMP_UNCOMPRESSED_BLOBS;
   static const std::string ARG_READ_TIMESTAMP;
   static const std::string ARG_GET_WRITE_UNIX_TIME;
 
@@ -165,7 +168,7 @@ class LDBCommand {
   std::string secondary_path_;
   std::string leader_path_;
   std::string column_family_name_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   DBWithTTL* db_ttl_;
   TransactionDB* db_txn_;
   std::map<std::string, ColumnFamilyHandle*> cf_handles_;

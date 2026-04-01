@@ -38,6 +38,8 @@ public class BlockBasedTableConfig extends TableFormatConfig {
     verifyCompression = false;
     readAmpBytesPerBit = 0;
     formatVersion = 7;
+    separateKeyValueInDataBlock = false;
+    uniformCvThreshold = 0.2;
     enableIndexCompression = true;
     blockAlign = false;
     superBlockAlignmentSize = 0;
@@ -63,6 +65,7 @@ public class BlockBasedTableConfig extends TableFormatConfig {
       final boolean partitionFilters, final boolean optimizeFiltersForMemory,
       final boolean useDeltaEncoding, final boolean wholeKeyFiltering,
       final boolean verifyCompression, final int readAmpBytesPerBit, final int formatVersion,
+      final boolean separateKeyValueInDataBlock, final double uniformCvThreshold,
       final boolean enableIndexCompression, final boolean blockAlign,
       final long superBlockAlignmentSize, final long superBlockAlignmentSpaceOverheadRatio,
       final byte indexShortening, final byte indexSearchType, final byte filterPolicyType,
@@ -88,6 +91,8 @@ public class BlockBasedTableConfig extends TableFormatConfig {
     this.verifyCompression = verifyCompression;
     this.readAmpBytesPerBit = readAmpBytesPerBit;
     this.formatVersion = formatVersion;
+    this.separateKeyValueInDataBlock = separateKeyValueInDataBlock;
+    this.uniformCvThreshold = uniformCvThreshold;
     this.enableIndexCompression = enableIndexCompression;
     this.blockAlign = blockAlign;
     this.superBlockAlignmentSize = superBlockAlignmentSize;
@@ -754,6 +759,64 @@ public class BlockBasedTableConfig extends TableFormatConfig {
   }
 
   /**
+   * Determine if separate key value storage in data blocks is enabled.
+   * <p>
+   * See {@link #setSeparateKeyValueInDataBlock(boolean)}.
+   *
+   * @return true if separate key value in data block is enabled, false otherwise
+   */
+  public boolean separateKeyValueInDataBlock() {
+    return separateKeyValueInDataBlock;
+  }
+
+  /**
+   * When true, data blocks store keys and values separately. Keys are stored
+   * at the beginning of the block, followed by values at the end. This can
+   * improve read performance at a cost of a varint per restart interval (~1 bit
+   * per key by default), in addition to improving compression. Small values or
+   * low block_restart_interval may prefer to set this as false.
+   * <p>
+   * Default: false
+   *
+   * @param separateKeyValueInDataBlock true to enable, false to disable
+   *
+   * @return the reference to the current option.
+   */
+  public BlockBasedTableConfig setSeparateKeyValueInDataBlock(
+      final boolean separateKeyValueInDataBlock) {
+    this.separateKeyValueInDataBlock = separateKeyValueInDataBlock;
+    return this;
+  }
+
+  /**
+   * Get the coefficient of variation threshold for uniform key detection.
+   * <p>
+   * See {@link #setUniformCvThreshold(double)}.
+   *
+   * @return the uniform CV threshold
+   */
+  public double uniformCvThreshold() {
+    return uniformCvThreshold;
+  }
+
+  /**
+   * Coefficient of variation (CV) threshold used to determine if keys in an
+   * index block are uniformly distributed. A lower value requires more uniform
+   * distribution. Set to &lt; 0 (e.g. -1) to disable. Only used when
+   * key uniformity tracking is enabled for index blocks.
+   * <p>
+   * Default: 0.2
+   *
+   * @param uniformCvThreshold the threshold value
+   *
+   * @return the reference to the current option.
+   */
+  public BlockBasedTableConfig setUniformCvThreshold(final double uniformCvThreshold) {
+    this.uniformCvThreshold = uniformCvThreshold;
+    return this;
+  }
+
+  /**
    * Determine if index compression is enabled.
    * <p>
    * See {@link #setEnableIndexCompression(boolean)}.
@@ -1016,8 +1079,9 @@ public class BlockBasedTableConfig extends TableFormatConfig {
         persistentCacheHandle, blockSize, blockSizeDeviation, blockRestartInterval,
         indexBlockRestartInterval, metadataBlockSize, partitionFilters, optimizeFiltersForMemory,
         useDeltaEncoding, filterPolicyHandle, wholeKeyFiltering, verifyCompression,
-        readAmpBytesPerBit, formatVersion, enableIndexCompression, blockAlign,
-        superBlockAlignmentSize, superBlockAlignmentSpaceOverheadRatio, indexShortening.getValue(),
+        readAmpBytesPerBit, formatVersion, separateKeyValueInDataBlock, uniformCvThreshold,
+        enableIndexCompression, blockAlign, superBlockAlignmentSize,
+        superBlockAlignmentSpaceOverheadRatio, indexShortening.getValue(),
         indexSearchType.getValue(), blockCacheSize, blockCacheNumShardBits);
   }
 
@@ -1032,10 +1096,11 @@ public class BlockBasedTableConfig extends TableFormatConfig {
       final boolean partitionFilters, final boolean optimizeFiltersForMemory,
       final boolean useDeltaEncoding, final long filterPolicyHandle,
       final boolean wholeKeyFiltering, final boolean verifyCompression,
-      final int readAmpBytesPerBit, final int formatVersion, final boolean enableIndexCompression,
-      final boolean blockAlign, final long superBlockAlignmentSize,
-      final long superBlockAlignmentSpaceOverheadRatio, final byte indexShortening,
-      final byte indexSearchType,
+      final int readAmpBytesPerBit, final int formatVersion,
+      final boolean separateKeyValueInDataBlock, final double uniformCvThreshold,
+      final boolean enableIndexCompression, final boolean blockAlign,
+      final long superBlockAlignmentSize, final long superBlockAlignmentSpaceOverheadRatio,
+      final byte indexShortening, final byte indexSearchType,
 
       @Deprecated final long blockCacheSize, @Deprecated final int blockCacheNumShardBits);
 
@@ -1064,6 +1129,8 @@ public class BlockBasedTableConfig extends TableFormatConfig {
   private boolean verifyCompression;
   private int readAmpBytesPerBit;
   private int formatVersion;
+  private boolean separateKeyValueInDataBlock;
+  private double uniformCvThreshold;
   private boolean enableIndexCompression;
   private boolean blockAlign;
   private long superBlockAlignmentSize;

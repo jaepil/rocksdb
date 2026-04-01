@@ -36,6 +36,9 @@ bool LevelCompactionPicker::NeedsCompaction(
   if (!vstorage->FilesMarkedForForcedBlobGC().empty()) {
     return true;
   }
+  if (!vstorage->ReadTriggeredCompactionFiles().empty()) {
+    return true;
+  }
   for (int i = 0; i <= vstorage->MaxInputLevel(); i++) {
     if (vstorage->CompactionScore(i) >= 1) {
       return true;
@@ -325,6 +328,14 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     compaction_reason_ = CompactionReason::kForcedBlobGC;
     return;
   }
+
+  // Read-triggered compaction
+  PickFileToCompact(vstorage_->ReadTriggeredCompactionFiles(),
+                    CompactToNextLevel::kYes);
+  if (!start_level_inputs_.empty()) {
+    compaction_reason_ = CompactionReason::kReadTriggered;
+    return;
+  }
 }
 
 bool LevelCompactionBuilder::SetupOtherL0FilesIfNeeded() {
@@ -404,7 +415,15 @@ void LevelCompactionBuilder::SetupOtherFilesWithRoundRobinExpansion() {
   tmp_start_level_inputs = start_level_inputs_;
   // TODO (zichen): Future parallel round-robin may also need to update this
   // Constraint 1b (only expand till the end)
-  for (size_t i = start_index + 1; i < level_files.size(); i++) {
+  size_t next_index = start_index + 1;
+  const FileMetaData* last_file = start_level_inputs_.files.back();
+  for (size_t j = next_index; j < level_files.size(); j++) {
+    if (level_files[j] == last_file) {
+      next_index = j + 1;
+      break;
+    }
+  }
+  for (size_t i = next_index; i < level_files.size(); i++) {
     auto* f = level_files[i];
     if (f->being_compacted) {
       // Constraint 1a

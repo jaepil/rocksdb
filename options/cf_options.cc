@@ -582,6 +582,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, periodic_compaction_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"read_triggered_compaction_threshold",
+         {offsetof(struct MutableCFOptions,
+                   read_triggered_compaction_threshold),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"preclude_last_level_data_seconds",
          {offsetof(struct MutableCFOptions, preclude_last_level_data_seconds),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -919,6 +924,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, cf_allow_ingest_behind),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"memtable_batch_lookup_optimization",
+         {offsetof(struct ImmutableCFOptions,
+                   memtable_batch_lookup_optimization),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
 };
 
 const std::string OptionsHelper::kCFOptionsName = "ColumnFamilyOptions";
@@ -1059,7 +1069,9 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       blob_cache(cf_options.blob_cache),
       persist_user_defined_timestamps(
           cf_options.persist_user_defined_timestamps),
-      cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind) {}
+      cf_allow_ingest_behind(cf_options.cf_allow_ingest_behind),
+      memtable_batch_lookup_optimization(
+          cf_options.memtable_batch_lookup_optimization) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 
@@ -1197,6 +1209,8 @@ void MutableCFOptions::Dump(Logger* log) const {
                  ttl);
   ROCKS_LOG_INFO(log, "              periodic_compaction_seconds: %" PRIu64,
                  periodic_compaction_seconds);
+  ROCKS_LOG_INFO(log, "    read_triggered_compaction_threshold: %f",
+                 read_triggered_compaction_threshold);
   ROCKS_LOG_INFO(log,
                  "              preclude_last_level_data_seconds: %" PRIu64,
                  preclude_last_level_data_seconds);

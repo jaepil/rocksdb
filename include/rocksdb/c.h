@@ -732,6 +732,7 @@ enum {
   rocksdb_size_approximation_flags_none = 0,
   rocksdb_size_approximation_flags_include_memtable = 1 << 0,
   rocksdb_size_approximation_flags_include_files = 1 << 1,
+  rocksdb_size_approximation_flags_include_blob_files = 1 << 2,
 };
 
 extern ROCKSDB_LIBRARY_API void rocksdb_approximate_sizes_cf_with_flags(
@@ -1195,6 +1196,9 @@ rocksdb_block_based_options_set_whole_key_filtering(
     rocksdb_block_based_table_options_t*, unsigned char);
 extern ROCKSDB_LIBRARY_API void rocksdb_block_based_options_set_format_version(
     rocksdb_block_based_table_options_t*, int);
+extern ROCKSDB_LIBRARY_API void
+rocksdb_block_based_options_set_separate_key_value_in_data_block(
+    rocksdb_block_based_table_options_t*, unsigned char);
 enum {
   rocksdb_block_based_table_index_type_binary_search = 0,
   rocksdb_block_based_table_index_type_hash_search = 1,
@@ -1476,6 +1480,10 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_paranoid_checks(
     rocksdb_options_t*, unsigned char);
 extern ROCKSDB_LIBRARY_API unsigned char rocksdb_options_get_paranoid_checks(
     rocksdb_options_t*);
+extern ROCKSDB_LIBRARY_API void rocksdb_options_set_open_files_async(
+    rocksdb_options_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char rocksdb_options_get_open_files_async(
+    rocksdb_options_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_db_paths(
     rocksdb_options_t*, const rocksdb_dbpath_t** path_values, size_t num_paths);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_cf_paths(
@@ -1668,13 +1676,6 @@ rocksdb_options_set_skip_stats_update_on_db_open(rocksdb_options_t* opt,
                                                  unsigned char val);
 extern ROCKSDB_LIBRARY_API unsigned char
 rocksdb_options_get_skip_stats_update_on_db_open(rocksdb_options_t* opt);
-extern ROCKSDB_LIBRARY_API void
-rocksdb_options_set_skip_checking_sst_file_sizes_on_db_open(
-    rocksdb_options_t* opt, unsigned char val);
-extern ROCKSDB_LIBRARY_API unsigned char
-rocksdb_options_get_skip_checking_sst_file_sizes_on_db_open(
-    rocksdb_options_t* opt);
-
 /* Blob Options Settings */
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_enable_blob_files(
     rocksdb_options_t* opt, unsigned char val);
@@ -1709,6 +1710,19 @@ extern ROCKSDB_LIBRARY_API double rocksdb_options_get_blob_gc_age_cutoff(
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_blob_gc_force_threshold(
     rocksdb_options_t* opt, double val);
 extern ROCKSDB_LIBRARY_API double rocksdb_options_get_blob_gc_force_threshold(
+    rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_read_triggered_compaction_threshold(rocksdb_options_t* opt,
+                                                        double val);
+extern ROCKSDB_LIBRARY_API double
+rocksdb_options_get_read_triggered_compaction_threshold(rocksdb_options_t* opt);
+
+extern ROCKSDB_LIBRARY_API void
+rocksdb_options_set_max_compaction_trigger_wakeup_seconds(
+    rocksdb_options_t* opt, uint64_t val);
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_options_get_max_compaction_trigger_wakeup_seconds(
     rocksdb_options_t* opt);
 
 extern ROCKSDB_LIBRARY_API void
@@ -2181,7 +2195,12 @@ enum {
   rocksdb_internal_range_del_reseek_count,
   rocksdb_block_read_cpu_time,
   rocksdb_internal_merge_point_lookup_count,
-  rocksdb_total_metric_count = 80
+  rocksdb_data_block_read_byte,
+  rocksdb_index_block_read_byte,
+  rocksdb_filter_block_read_byte,
+  rocksdb_compression_dict_block_read_byte,
+  rocksdb_metadata_block_read_byte,
+  rocksdb_total_metric_count = 85
 };
 
 extern ROCKSDB_LIBRARY_API void rocksdb_set_perf_level(int);
@@ -2318,9 +2337,6 @@ extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_tailing(
     rocksdb_readoptions_t*, unsigned char);
 extern ROCKSDB_LIBRARY_API unsigned char rocksdb_readoptions_get_tailing(
     rocksdb_readoptions_t*);
-// The functionality that this option controlled has been removed.
-extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_managed(
-    rocksdb_readoptions_t*, unsigned char);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_readahead_size(
     rocksdb_readoptions_t*, size_t);
 extern ROCKSDB_LIBRARY_API size_t
@@ -2727,13 +2743,13 @@ extern ROCKSDB_LIBRARY_API void rocksdb_try_catch_up_with_primary(
 /* SliceTransform */
 
 extern ROCKSDB_LIBRARY_API rocksdb_slicetransform_t*
-rocksdb_slicetransform_create(
-    void* state, void (*destructor)(void*),
-    char* (*transform)(void*, const char* key, size_t length,
-                       size_t* dst_length),
-    unsigned char (*in_domain)(void*, const char* key, size_t length),
-    unsigned char (*in_range)(void*, const char* key, size_t length),
-    const char* (*name)(void*));
+rocksdb_slicetransform_create(void* state, void (*destructor)(void*),
+                              char* (*transform)(void*, const char* key,
+                                                 size_t length,
+                                                 size_t* dst_length),
+                              unsigned char (*in_domain)(void*, const char* key,
+                                                         size_t length),
+                              const char* (*name)(void*));
 extern ROCKSDB_LIBRARY_API rocksdb_slicetransform_t*
 rocksdb_slicetransform_create_fixed_prefix(size_t);
 extern ROCKSDB_LIBRARY_API rocksdb_slicetransform_t*

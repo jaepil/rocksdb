@@ -22,6 +22,40 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {}  // anonymous namespace
 
+// After copying, we rely on the caller to ensure no double releases. Fragile,
+// but keeps copying cheap.
+PinnedTableReader& PinnedTableReader::operator=(
+    const PinnedTableReader& other) {
+  TableReader* r = other.reader_.load(std::memory_order_acquire);
+  // Only read handle_ when reader_ is non-null. Pin() writes handle_ before
+  // reader_ (with release), so a non-null reader_ guarantees handle_ is stable.
+  // If reader_ is null, Pin() may be in progress — avoid reading handle_.
+  handle_ = (r != nullptr) ? other.handle_ : nullptr;
+  reader_.store(r, std::memory_order_release);
+  return *this;
+}
+
+Cache::Handle* PinnedTableReader::GetCacheHandle() const {
+  (void)reader_.load(std::memory_order_acquire);
+  return handle_;
+}
+
+void PinnedTableReader::Pin(Cache::Handle* handle, TableReader* reader) {
+  assert(handle != nullptr);
+  assert(reader != nullptr);
+  handle_ = handle;
+  reader_.store(reader, std::memory_order_release);
+}
+
+void PinnedTableReader::Release(Cache* cache) {
+  (void)reader_.load(std::memory_order_acquire);
+  if (handle_ != nullptr) {
+    cache->Release(handle_);
+    handle_ = nullptr;
+    reader_.store(nullptr, std::memory_order_relaxed);
+  }
+}
+
 uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
   assert(number <= kFileNumberMask);
   return number | (path_id * (kFileNumberMask + 1));
@@ -83,7 +117,7 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutVarint32Varint64(dst, kNextFileNumber, next_file_number_);
   }
   if (has_max_column_family_) {
-    PutVarint32Varint32(dst, kMaxColumnFamily, max_column_family_);
+    PutVarint32(dst, kMaxColumnFamily, max_column_family_);
   }
   if (has_min_log_number_to_keep_) {
     PutVarint32Varint64(dst, kMinLogNumberToKeep, min_log_number_to_keep_);
@@ -143,7 +177,7 @@ bool VersionEdit::EncodeTo(std::string* dst,
 
   // 0 is default and does not need to be explicitly written
   if (column_family_ != 0) {
-    PutVarint32Varint32(dst, kColumnFamily, column_family_);
+    PutVarint32(dst, kColumnFamily, column_family_);
   }
 
   if (is_column_family_add_) {

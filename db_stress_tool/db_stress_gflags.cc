@@ -203,6 +203,9 @@ DEFINE_int32(open_files, ROCKSDB_NAMESPACE::Options().max_open_files,
              "Maximum number of files to keep open at the same time "
              "(use default if == 0)");
 
+DEFINE_bool(open_files_async, ROCKSDB_NAMESPACE::Options().open_files_async,
+            "Options.open_files_async");
+
 DEFINE_uint64(compressed_secondary_cache_size, 0,
               "Number of bytes to use as a cache of compressed data."
               " 0 means use default settings.");
@@ -252,6 +255,11 @@ DEFINE_int32(format_version,
              static_cast<int32_t>(
                  ROCKSDB_NAMESPACE::BlockBasedTableOptions().format_version),
              "Format version of SST files.");
+
+DEFINE_bool(separate_key_value_in_data_block,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                .separate_key_value_in_data_block,
+            "If true, data blocks store keys and values separately.");
 
 DEFINE_int32(
     index_block_restart_interval,
@@ -314,6 +322,13 @@ DEFINE_int32(
     "GetLiveFilesChecksumInfo() to verify if it returns "
     "OK or violate any internal assertion. If N == 0, do not call the "
     "interface.");
+
+DEFINE_bool(
+    checkpoint_atomic_flush, false,
+    "If true, when calling GetLiveFilesStorageInfo (e.g., during checkpoint), "
+    "use LiveFilesStorageInfoOptions::atomic_flush=true to force atomic flush "
+    "of all column families regardless of the DBOptions::atomic_flush setting. "
+    "This exercises the per-request atomic flush override code path.");
 
 DEFINE_int32(
     get_all_column_family_metadata_one_in, 1000000,
@@ -418,13 +433,23 @@ DEFINE_bool(fifo_allow_compaction, false,
 DEFINE_uint64(fifo_compaction_max_data_files_size_mb, 0,
               "If non-zero, set "
               "`Options::compaction_options_fifo.max_data_files_size` to this "
-              "value (in MB). Only takes effect with FIFO compaction.");
+              "value (in MB). Only takes effect with FIFO compaction. "
+              "When non-zero, overrides `max_table_files_size` for "
+              "determining when FIFO drops old SST files.");
+
+DEFINE_uint64(fifo_compaction_max_table_files_size_mb, 0,
+              "If non-zero, set "
+              "`Options::compaction_options_fifo.max_table_files_size` to this "
+              "value (in MB). Only takes effect with FIFO compaction. "
+              "When zero, uses the default (1GB). Ignored when "
+              "`fifo_compaction_max_data_files_size_mb` is non-zero.");
 
 DEFINE_bool(fifo_compaction_use_kv_ratio_compaction, false,
             "If true, set "
             "`Options::compaction_options_fifo.use_kv_ratio_compaction = "
-            "true`. Requires fifo_allow_compaction and "
-            "fifo_compaction_max_data_files_size_mb > 0.");
+            "true`. Recommends fifo_allow_compaction and "
+            "fifo_compaction_max_data_files_size_mb > 0 (falls back to "
+            "cost-based intra-L0 compaction if not set).");
 
 DEFINE_bool(allow_concurrent_memtable_write, false,
             "Allow multi-writers to update mem tables in parallel.");
@@ -612,6 +637,19 @@ DEFINE_int32(index_block_search_type,
                                       .index_block_search_type),
              "Search algorithm for index blocks (see `enum BlockSearchType` in "
              "table.h)");
+
+DEFINE_double(uniform_cv_threshold,
+              ROCKSDB_NAMESPACE::BlockBasedTableOptions().uniform_cv_threshold,
+              "CV threshold for marking index blocks as uniform. Set to -1 to "
+              "disable. (see `uniform_cv_threshold` in table.h)");
+
+DEFINE_bool(use_trie_index, false,
+            "Use trie-based user defined index (UDI) for SST files. "
+            "Compatible with all operation types (Put, Delete, Merge, etc.) "
+            "and all iteration directions (forward and reverse).");
+
+DEFINE_bool(test_backward_scan, true,
+            "Test backward iteration (Prev, SeekForPrev) in stress tests.");
 
 DEFINE_string(db, "", "Use the db with the following name.");
 
@@ -997,6 +1035,9 @@ DEFINE_uint64(max_manifest_file_size, 16384,
 DEFINE_int32(max_manifest_space_amp_pct, 500,
              "Max manifest space amp percentage for auto-tuning");
 
+DEFINE_bool(verify_manifest_content_on_close, false,
+            "If true, verify MANIFEST content (CRC + decode) on DB close");
+
 DEFINE_bool(in_place_update, false, "On true, does inplace update in memtable");
 
 DEFINE_string(memtablerep, "skip_list", "");
@@ -1053,6 +1094,11 @@ DEFINE_bool(write_identity_file,
 DEFINE_bool(avoid_flush_during_recovery,
             ROCKSDB_NAMESPACE::Options().avoid_flush_during_recovery,
             "Avoid flush during recovery");
+
+DEFINE_bool(
+    enforce_write_buffer_manager_during_recovery,
+    ROCKSDB_NAMESPACE::Options().enforce_write_buffer_manager_during_recovery,
+    "Enforce write buffer manager memory limit during WAL recovery");
 
 DEFINE_uint64(max_write_batch_group_size_bytes,
               ROCKSDB_NAMESPACE::Options().max_write_batch_group_size_bytes,
@@ -1273,6 +1319,11 @@ DEFINE_bool(
 DEFINE_uint64(stats_dump_period_sec,
               ROCKSDB_NAMESPACE::Options().stats_dump_period_sec,
               "Gap between printing stats to log in seconds");
+
+DEFINE_uint64(
+    max_compaction_trigger_wakeup_seconds,
+    ROCKSDB_NAMESPACE::Options().max_compaction_trigger_wakeup_seconds,
+    "Sets DB option max_compaction_trigger_wakeup_seconds.");
 
 DEFINE_bool(verification_only, false,
             "If true, tests will only execute verification step");
@@ -1507,6 +1558,10 @@ DEFINE_uint32(uncache_aggressiveness,
               "obsolete. 0 = disabled, 1 = minimum, 100 = moderate, 10000 = "
               "normal max");
 
+DEFINE_uint32(verify_output_flags, 0,
+              "Sets CF option verify_output_flags as a uint32_t bitmask. "
+              "See VerifyOutputFlags enum for bit definitions.");
+
 DEFINE_bool(paranoid_memory_checks,
             ROCKSDB_NAMESPACE::Options().paranoid_memory_checks,
             "Sets CF option paranoid_memory_checks.");
@@ -1515,6 +1570,10 @@ DEFINE_bool(
     memtable_veirfy_per_key_checksum_on_seek,
     ROCKSDB_NAMESPACE::Options().memtable_veirfy_per_key_checksum_on_seek,
     "Sets CF option memtable_veirfy_per_key_checksum_on_seek.");
+
+DEFINE_bool(memtable_batch_lookup_optimization,
+            ROCKSDB_NAMESPACE::Options().memtable_batch_lookup_optimization,
+            "Sets CF option memtable_batch_lookup_optimization.");
 
 DEFINE_uint32(commit_bypass_memtable_one_in, 0,
               "If greater than zero, transaction option will set "
@@ -1541,6 +1600,10 @@ DEFINE_int32(compaction_on_deletion_window_size, 100,
 DEFINE_double(compaction_on_deletion_ratio, 0.5,
               "Deletion ratio threshold for triggering compaction. "
               "Default: 0.5 (50%)");
+
+DEFINE_double(read_triggered_compaction_threshold,
+              ROCKSDB_NAMESPACE::Options().read_triggered_compaction_threshold,
+              "Sets CF option read_triggered_compaction_threshold.");
 
 DEFINE_bool(
     auto_refresh_iterator_with_snapshot,
