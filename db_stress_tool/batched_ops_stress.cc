@@ -13,7 +13,9 @@
 namespace ROCKSDB_NAMESPACE {
 class BatchedOpsStressTest : public StressTest {
  public:
-  BatchedOpsStressTest() = default;
+  BatchedOpsStressTest(int db_index, const std::string& db_path,
+                       const std::string& ev_path, const std::string& sec_path)
+      : StressTest(db_index, db_path, ev_path, sec_path) {}
   virtual ~BatchedOpsStressTest() = default;
 
   bool IsStateTracked() const override { return false; }
@@ -585,9 +587,13 @@ class BatchedOpsStressTest : public StressTest {
 
       ro_copies[i] = readoptions;
       ro_copies[i].snapshot = snapshot;
-      if (thread->rand.OneIn(2) &&
-          GetNextPrefix(prefix_slices[i], &(upper_bounds[i]))) {
-        // For half of the time, set the upper bound to the next prefix
+      // This verifier compares 10 prefix scans entry-by-entry, so each
+      // iterator must be constrained to its seek prefix before we assert
+      // lockstep progress across them. Either set an upper bound or
+      // prefix_same_as_start so no iterator overshoots its prefix.
+      if (GetNextPrefix(prefix_slices[i], &(upper_bounds[i])) &&
+          thread->rand.OneIn(2)) {
+        // Half the time, bound by upper key
         ub_slices[i] = upper_bounds[i];
         ro_copies[i].iterate_upper_bound = &(ub_slices[i]);
         if (FLAGS_use_sqfc_for_range_queries) {
@@ -595,6 +601,9 @@ class BatchedOpsStressTest : public StressTest {
               sqfc_factory_->GetTableFilterForRangeQuery(prefix_slices[i],
                                                          ub_slices[i]);
         }
+      } else {
+        // Otherwise, bound by prefix
+        ro_copies[i].prefix_same_as_start = true;
       }
 
       iters[i].reset(db_->NewIterator(ro_copies[i], cfh));
@@ -715,7 +724,11 @@ class BatchedOpsStressTest : public StressTest {
   }
 };
 
-StressTest* CreateBatchedOpsStressTest() { return new BatchedOpsStressTest(); }
+StressTest* CreateBatchedOpsStressTest(int db_index, const std::string& db_path,
+                                       const std::string& ev_path,
+                                       const std::string& sec_path) {
+  return new BatchedOpsStressTest(db_index, db_path, ev_path, sec_path);
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS

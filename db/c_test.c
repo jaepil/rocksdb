@@ -205,6 +205,27 @@ static void CheckDel(void* ptr, const char* k, size_t klen) {
   (*state)++;
 }
 
+static void NopPut(void* ptr, const char* k, size_t klen, const char* v,
+                   size_t vlen) {
+  (void)ptr;
+  (void)k;
+  (void)klen;
+  (void)v;
+  (void)vlen;
+}
+
+static void NopDel(void* ptr, const char* k, size_t klen) {
+  (void)ptr;
+  (void)k;
+  (void)klen;
+}
+
+static void CheckLogData(void* ptr, const char* blob, size_t blen) {
+  CheckEqual("log_blob", blob, blen);
+  int* found = (int*)ptr;
+  *found = 1;
+}
+
 // Callback from rocksdb_writebatch_iterate_cf()
 static void CheckPutCF(void* ptr, uint32_t cfid, const char* k, size_t klen,
                        const char* v, size_t vlen) {
@@ -867,6 +888,9 @@ int main(int argc, char** argv) {
   rocksdb_block_based_options_set_block_cache(table_options, cache);
   rocksdb_block_based_options_set_data_block_index_type(table_options, 1);
   rocksdb_block_based_options_set_data_block_hash_ratio(table_options, 0.75);
+  rocksdb_block_based_options_set_index_block_search_type(
+      table_options, rocksdb_block_based_table_index_block_search_type_auto);
+  rocksdb_block_based_options_set_uniform_cv_threshold(table_options, 0.2);
   rocksdb_block_based_options_set_top_level_index_pinning_tier(table_options,
                                                                1);
   rocksdb_block_based_options_set_partition_pinning_tier(table_options, 2);
@@ -993,6 +1017,12 @@ int main(int argc, char** argv) {
     CheckCondition(memcmp(after_db_id, before_db_id, after_db_id_len) != 0);
     Free(&before_db_id);
     Free(&after_db_id);
+
+    rocksdb_backup_engine_stop_backup(be);
+    rocksdb_backup_engine_create_new_backup(be, db, &err);
+    CheckCondition(err != NULL);
+    free(err);
+    err = NULL;
 
     rocksdb_backup_engine_close(be);
   }
@@ -2643,6 +2673,10 @@ int main(int argc, char** argv) {
     CheckCondition(150 ==
                    rocksdb_options_get_memtable_avg_op_scan_flush_trigger(o));
 
+    rocksdb_options_set_min_tombstones_for_range_conversion(o, 200);
+    CheckCondition(200 ==
+                   rocksdb_options_get_min_tombstones_for_range_conversion(o));
+
     rocksdb_options_set_ttl(o, 5000);
     CheckCondition(5000 == rocksdb_options_get_ttl(o));
 
@@ -2732,6 +2766,10 @@ int main(int argc, char** argv) {
     CheckCondition(
         1 == rocksdb_options_get_use_direct_io_for_flush_and_compaction(o));
 
+    rocksdb_options_set_use_direct_io_for_compaction_reads(o, 1);
+    CheckCondition(1 ==
+                   rocksdb_options_get_use_direct_io_for_compaction_reads(o));
+
     rocksdb_options_set_is_fd_close_on_exec(o, 1);
     CheckCondition(1 == rocksdb_options_get_is_fd_close_on_exec(o));
 
@@ -2786,6 +2824,15 @@ int main(int argc, char** argv) {
 
     rocksdb_options_set_memtable_huge_page_size(o, 25);
     CheckCondition(25 == rocksdb_options_get_memtable_huge_page_size(o));
+
+    // memtable_batch_lookup_optimization defaults to 0; flip to 1 to verify
+    // the setter is wired through to the underlying C++ ColumnFamilyOptions
+    // field.
+    CheckCondition(0 ==
+                   rocksdb_options_get_memtable_batch_lookup_optimization(o));
+    rocksdb_options_set_memtable_batch_lookup_optimization(o, 1);
+    CheckCondition(1 ==
+                   rocksdb_options_get_memtable_batch_lookup_optimization(o));
 
     rocksdb_options_set_max_successive_merges(o, 26);
     CheckCondition(26 == rocksdb_options_get_max_successive_merges(o));
@@ -2844,6 +2891,9 @@ int main(int argc, char** argv) {
     rocksdb_options_set_track_and_verify_wals_in_manifest(o, 42);
     CheckCondition(1 ==
                    rocksdb_options_get_track_and_verify_wals_in_manifest(o));
+    CheckCondition(0 == rocksdb_options_get_async_wal_precreate(o));
+    rocksdb_options_set_async_wal_precreate(o, 1);
+    CheckCondition(1 == rocksdb_options_get_async_wal_precreate(o));
 
     /* Blob Options */
     rocksdb_options_set_enable_blob_files(o, 1);
@@ -2947,6 +2997,8 @@ int main(int argc, char** argv) {
     CheckCondition(1 == rocksdb_options_get_use_direct_reads(copy));
     CheckCondition(
         1 == rocksdb_options_get_use_direct_io_for_flush_and_compaction(copy));
+    CheckCondition(
+        1 == rocksdb_options_get_use_direct_io_for_compaction_reads(copy));
     CheckCondition(1 == rocksdb_options_get_is_fd_close_on_exec(copy));
     CheckCondition(18 == rocksdb_options_get_stats_dump_period_sec(copy));
     CheckCondition(5 == rocksdb_options_get_stats_persist_period_sec(copy));
@@ -2970,6 +3022,8 @@ int main(int argc, char** argv) {
                    rocksdb_options_get_memtable_prefix_bloom_size_ratio(copy));
     CheckCondition(24 == rocksdb_options_get_max_compaction_bytes(copy));
     CheckCondition(25 == rocksdb_options_get_memtable_huge_page_size(copy));
+    CheckCondition(
+        1 == rocksdb_options_get_memtable_batch_lookup_optimization(copy));
     CheckCondition(26 == rocksdb_options_get_max_successive_merges(copy));
     CheckCondition(27 == rocksdb_options_get_bloom_locality(copy));
     CheckCondition(1 == rocksdb_options_get_inplace_update_support(copy));
@@ -3094,6 +3148,12 @@ int main(int argc, char** argv) {
     CheckCondition(150 ==
                    rocksdb_options_get_memtable_avg_op_scan_flush_trigger(o));
 
+    rocksdb_options_set_min_tombstones_for_range_conversion(copy, 1000);
+    CheckCondition(
+        1000 == rocksdb_options_get_min_tombstones_for_range_conversion(copy));
+    CheckCondition(200 ==
+                   rocksdb_options_get_min_tombstones_for_range_conversion(o));
+
     rocksdb_options_set_ttl(copy, 8000);
     CheckCondition(8000 == rocksdb_options_get_ttl(copy));
     CheckCondition(5000 == rocksdb_options_get_ttl(o));
@@ -3216,6 +3276,12 @@ int main(int argc, char** argv) {
         0 == rocksdb_options_get_use_direct_io_for_flush_and_compaction(copy));
     CheckCondition(
         1 == rocksdb_options_get_use_direct_io_for_flush_and_compaction(o));
+
+    rocksdb_options_set_use_direct_io_for_compaction_reads(copy, 0);
+    CheckCondition(
+        0 == rocksdb_options_get_use_direct_io_for_compaction_reads(copy));
+    CheckCondition(1 ==
+                   rocksdb_options_get_use_direct_io_for_compaction_reads(o));
 
     rocksdb_options_set_is_fd_close_on_exec(copy, 0);
     CheckCondition(0 == rocksdb_options_get_is_fd_close_on_exec(copy));
@@ -3397,6 +3463,12 @@ int main(int argc, char** argv) {
 
     rocksdb_readoptions_set_async_io(ro, 1);
     CheckCondition(1 == rocksdb_readoptions_get_async_io(ro));
+
+    // optimize_multiget_for_io defaults to true (1); flip to 0 to verify the
+    // setter is wired through to the underlying C++ ReadOptions field.
+    CheckCondition(1 == rocksdb_readoptions_get_optimize_multiget_for_io(ro));
+    rocksdb_readoptions_set_optimize_multiget_for_io(ro, 0);
+    CheckCondition(0 == rocksdb_readoptions_get_optimize_multiget_for_io(ro));
 
     rocksdb_readoptions_destroy(ro);
   }
@@ -3643,6 +3715,52 @@ int main(int argc, char** argv) {
     CheckCondition(37 ==
                    rocksdb_backup_engine_options_get_restore_rate_limit(bdo));
 
+    {
+      rocksdb_ratelimiter_t* limiter = rocksdb_ratelimiter_create_with_mode(
+          1024 * 1024, 100 * 1000, 10, 2, 0);
+      rocksdb_backup_engine_options_set_backup_rate_limiter(bdo, limiter);
+      rocksdb_backup_engine_options_set_restore_rate_limiter(bdo, limiter);
+      rocksdb_ratelimiter_destroy(limiter);
+
+      rocksdb_backup_engine_options_t* rate_beo =
+          rocksdb_backup_engine_options_create(dbbackupname);
+      rocksdb_ratelimiter_t* backup_limiter =
+          rocksdb_ratelimiter_create_with_mode(1024 * 1024, 100 * 1000, 10, 2,
+                                               0);
+      rocksdb_ratelimiter_t* restore_limiter =
+          rocksdb_ratelimiter_create_with_mode(1024 * 1024, 100 * 1000, 10, 2,
+                                               0);
+      rocksdb_backup_engine_options_set_backup_rate_limiter(rate_beo,
+                                                            backup_limiter);
+      rocksdb_backup_engine_options_set_restore_rate_limiter(rate_beo,
+                                                             restore_limiter);
+      rocksdb_ratelimiter_destroy(backup_limiter);
+      rocksdb_ratelimiter_destroy(restore_limiter);
+      rocksdb_env_t* rate_benv = rocksdb_create_default_env();
+      rocksdb_backup_engine_t* rate_be =
+          rocksdb_backup_engine_open_opts(rate_beo, rate_benv, &err);
+      rocksdb_backup_engine_options_destroy(rate_beo);
+      rocksdb_env_destroy(rate_benv);
+      CheckNoError(err);
+      rocksdb_backup_engine_create_new_backup(rate_be, db, &err);
+      CheckNoError(err);
+      {
+        char rate_restore_path[220];
+        snprintf(rate_restore_path, sizeof(rate_restore_path),
+                 "%s.rate_restore", dbname);
+        rocksdb_restore_options_t* rate_restore_opts =
+            rocksdb_restore_options_create();
+        rocksdb_backup_engine_restore_db_from_latest_backup(
+            rate_be, rate_restore_path, rate_restore_path, rate_restore_opts,
+            &err);
+        CheckNoError(err);
+        rocksdb_restore_options_destroy(rate_restore_opts);
+        rocksdb_destroy_db(options, rate_restore_path, &err);
+        err = NULL;
+      }
+      rocksdb_backup_engine_close(rate_be);
+    }
+
     rocksdb_backup_engine_options_set_max_background_operations(bdo, 20);
     CheckCondition(
         20 == rocksdb_backup_engine_options_get_max_background_operations(bdo));
@@ -3754,6 +3872,43 @@ int main(int argc, char** argv) {
     }
   }
 
+  StartPhase("transactiondb_set_write_policy_prepared");
+  {
+    char wp_dbname[200];
+    rocksdb_transactiondb_t* wp_txn_db;
+    rocksdb_transactiondb_options_t* wp_txn_opts;
+    snprintf(wp_dbname, sizeof(wp_dbname), "%s/rocksdb_c_test-txnwp-%d",
+             GetTempDir(), (int)geteuid());
+    rocksdb_destroy_db(options, wp_dbname, &err);
+    Free(&err);
+    wp_txn_opts = rocksdb_transactiondb_options_create();
+    rocksdb_transactiondb_options_set_write_policy(
+        wp_txn_opts, rocksdb_txndb_write_policy_write_prepared);
+    rocksdb_options_set_create_if_missing(options, 1);
+    // create new TransactionDB with write policy WRITE_PREPARED
+    wp_txn_db =
+        rocksdb_transactiondb_open(options, wp_txn_opts, wp_dbname, &err);
+    CheckNoError(err);
+    {
+      rocksdb_transaction_options_t* wp_txn_options =
+          rocksdb_transaction_options_create();
+      rocksdb_transaction_t* wp_txn =
+          rocksdb_transaction_begin(wp_txn_db, woptions, wp_txn_options, NULL);
+      // write one record within a transaction
+      rocksdb_transaction_put(wp_txn, "k", 1, "v", 1, &err);
+      CheckNoError(err);
+      rocksdb_transaction_commit(wp_txn, &err);
+      CheckNoError(err);
+      rocksdb_transaction_destroy(wp_txn);
+      rocksdb_transaction_options_destroy(wp_txn_options);
+    }
+    CheckTxnDBGet(wp_txn_db, roptions, "k", "v");
+    rocksdb_transactiondb_close(wp_txn_db);
+    rocksdb_transactiondb_options_destroy(wp_txn_opts);
+    rocksdb_destroy_db(options, wp_dbname, &err);
+    CheckNoError(err);
+  }
+
   StartPhase("transactions");
   {
     rocksdb_close(db);
@@ -3858,9 +4013,34 @@ int main(int argc, char** argv) {
       CheckMultiGetValues(3, vals, vals_sizes, errs, expected);
     }
 
+    rocksdb_transaction_put_log_data(txn, "log_blob", 8);
+    // record sequence number before commit so we can scan the WAL after
+    rocksdb_t* base_db_ld = rocksdb_transactiondb_get_base_db(txn_db);
+    uint64_t seq_before = rocksdb_get_latest_sequence_number(base_db_ld);
+
     // commit
     rocksdb_transaction_commit(txn, &err);
     CheckNoError(err);
+
+    // verify log data was written to WAL by scanning batches since seq_before
+    {
+      rocksdb_wal_iterator_t* wal_iter =
+          rocksdb_get_updates_since(base_db_ld, seq_before, NULL, &err);
+      CheckNoError(err);
+      int log_found = 0;
+      for (; rocksdb_wal_iter_valid(wal_iter) && !log_found;
+           rocksdb_wal_iter_next(wal_iter)) {
+        uint64_t seq;
+        rocksdb_writebatch_t* wal_wb =
+            rocksdb_wal_iter_get_batch(wal_iter, &seq);
+        rocksdb_writebatch_iterate_ld(wal_wb, &log_found, NopPut, NopDel,
+                                      CheckLogData);
+        rocksdb_writebatch_destroy(wal_wb);
+      }
+      CheckCondition(log_found == 1);
+      rocksdb_wal_iter_destroy(wal_iter);
+    }
+    rocksdb_transactiondb_close_base_db(base_db_ld);
 
     // read from outside transaction, after commit
     CheckTxnDBGet(txn_db, roptions, "foo", "hello");

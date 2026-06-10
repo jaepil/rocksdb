@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "rocksdb/cache.h"
+#include "rocksdb/cleanable.h"
 #include "rocksdb/customizable.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
@@ -45,6 +46,67 @@ class WritableFileWriter;
 struct ConfigOptions;
 struct EnvOptions;
 class UserDefinedIndexFactory;
+
+// Hook for providing read-scoped storage for data blocks read from SST files.
+// This is configured through C++ options rather than OPTIONS files.
+//
+// Current support is limited to block-based table iterator scans and MultiScan
+// data-block reads. Reads using mmap ignore this provider and use normal
+// RocksDB block backing.
+//
+// The provider backs final data-block contents pinned by the scan. RocksDB may
+// still use ordinary temporary scratch for serialized block bytes, such as when
+// reading a block that may be compressed before decompressing or copying the
+// final data block into provider-backed storage.
+//
+// This is separate from MemoryAllocator because each allocation needs a
+// per-lease cleanup handle that RocksDB can attach to pinned blocks/slices, and
+// direct-I/O reads that use provider-backed read buffers need the requested
+// alignment to be passed to the provider.
+//
+// TODO: Extend support to point lookups (Get/MultiGet) once those paths can
+// preserve provider-backed block ownership.
+//
+// Requirements:
+// - If the same provider instance is shared by multiple concurrently active
+//   readers, `Allocate()` must be safe to call concurrently.
+// - `Lease::data` must point to at least `size` bytes of writable contiguous
+//   memory that remains valid until every copy of `Lease::cleanup` is reset.
+// - `Lease::data` must be aligned to `alignment` bytes, where `alignment` is a
+//   power of two and `1` means no special alignment requirement.
+// - When `alignment` is greater than 1, `Lease::size` must also be a multiple
+//   of `alignment` so it can be used as direct-I/O backing storage.
+// - `Lease::cleanup` must be non-null on success. Its cleanup may run on any
+//   thread that releases the last RocksDB reference. If the cleanup touches
+//   provider or other shared state, it must synchronize with Allocate() and
+//   other provider cleanup callbacks.
+// - After `Allocate()` succeeds, RocksDB releases `Lease::cleanup` on all
+//   paths, including later I/O or decompression failure.
+class ReadScopedBlockBufferProvider {
+ public:
+  // A Lease hands one writable backing allocation from the provider to
+  // RocksDB. For a provider-backed block, the final BlockContents data points
+  // into this allocation and RocksDB attaches `cleanup` to the resulting Blocks
+  // and any slices pinned from them. File-read scratch, copying, and
+  // decompression choices are implementation details outside this contract.
+  //
+  // The provider controls allocation reclamation. RocksDB keeps the data valid
+  // by copying `cleanup`; the provider must not reuse or release `data` until
+  // every copy of `cleanup` has been reset. `size` is the usable backing
+  // allocation size and may be larger than the requested allocation size. For
+  // direct-I/O reads, `size` must be a multiple of the requested alignment.
+  struct Lease {
+    // Writable contiguous memory for the loaded block.
+    char* data = nullptr;
+    size_t size = 0;
+    // Reclaims `data` after all derived pinned key/value slices are released.
+    SharedCleanablePtr cleanup;
+  };
+
+  virtual ~ReadScopedBlockBufferProvider() = default;
+
+  virtual Status Allocate(size_t size, size_t alignment, Lease* out) = 0;
+};
 
 // Types of checksums to use for checking integrity of logical blocks within
 // files. All checksums currently use 32 bits of checking power (1 in 4B
@@ -539,8 +601,60 @@ struct BlockBasedTableOptions {
 
   // EXPERIMENTAL
   //
+  // When true and user_defined_index_factory is set, the UDI becomes the
+  // primary index for reads. All reads (including internal operations like
+  // compaction and VerifyChecksum) automatically route through the UDI
+  // without needing ReadOptions::table_index_factory.
+  //
+  // Both the standard binary search index and the UDI are always fully
+  // built. The standard index serves as a safety fallback (e.g., for
+  // backup/restore or rollback to a non-UDI configuration). A future
+  // refactor will extract the index abstraction to allow skipping the
+  // standard index build when the UDI is primary.
+  //
+  // When the UDI is primary:
+  // - All reads automatically use the UDI (ReadOptions::table_index_factory
+  //   does not need to be set)
+  // - Partitioned index (kTwoLevelIndexSearch) and partitioned filters are
+  //   incompatible with this option
+  // - fail_if_no_udi_on_open is automatically enforced to prevent silent
+  //   data loss if these SSTs are opened without UDI support
+  //
+  // Recommended migration path:
+  //
+  // 1. Deploy with user_defined_index_factory set but
+  //    use_udi_as_primary_index=false (secondary mode). New SSTs are written
+  //    with both indexes. Reads use the standard index by default.
+  //
+  // 2. Validate reads through the UDI by setting
+  //    ReadOptions::table_index_factory on a subset of reads.
+  //
+  // 3. Compact the entire DB to rewrite all pre-existing SSTs with both
+  //    indexes. All SSTs must have a UDI block before proceeding.
+  //
+  // 4. Enable use_udi_as_primary_index=true. All reads use the UDI.
+  //
+  // Rollback: set use_udi_as_primary_index=false. Since the standard index
+  // is always fully populated, SSTs are immediately readable through the
+  // standard index. No compaction is required. All reads immediately
+  // revert to the standard index path.
+  //
+  // Backup/restore: the user_defined_index_factory is a shared_ptr that
+  // cannot survive Options serialization (e.g., GetStringFromDBOptions).
+  // Since the standard index is always fully populated, a restored DB can
+  // be opened and read without the factory (reads fall back to the standard
+  // index). Set the factory when opening the restored DB to resume using
+  // the UDI.
+  //
+  // Default: false (UDI is built alongside the standard index as a secondary)
+  bool use_udi_as_primary_index = false;
+
+  // EXPERIMENTAL
+  //
   // Return an error Status if a user_defined_index_factory is configured,
   // but there's no corresponding UDI block in the SST file being opened.
+  // When use_udi_as_primary_index is true, this check is automatically
+  // enforced (a missing UDI block is always an error in primary mode).
   bool fail_if_no_udi_on_open = false;
 
   // If true, place whole keys in the filter (not just prefixes).

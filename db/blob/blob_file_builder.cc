@@ -22,6 +22,7 @@
 #include "logging/logging.h"
 #include "options/cf_options.h"
 #include "options/options_helper.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "test_util/sync_point.h"
@@ -67,13 +68,11 @@ BlobFileBuilder::BlobFileBuilder(
       min_blob_size_(mutable_cf_options->min_blob_size),
       blob_file_size_(mutable_cf_options->blob_file_size),
       blob_compression_type_(mutable_cf_options->blob_compression_type),
-      // TODO: support most CompressionOptions with a new CF option
-      // blob_compression_opts
       // TODO with schema change: support custom compression manager and options
       // such as max_compressed_bytes_per_kb
       // NOTE: returns nullptr for kNoCompression
       blob_compressor_(GetBuiltinV2CompressionManager()->GetCompressor(
-          CompressionOptions{}, blob_compression_type_)),
+          mutable_cf_options->blob_compression_opts, blob_compression_type_)),
       blob_compressor_wa_(blob_compressor_
                               ? blob_compressor_->ObtainWorkingArea()
                               : Compressor::ManagedWorkingArea{}),
@@ -202,6 +201,8 @@ Status BlobFileBuilder::OpenBlobFileIfNeeded() {
   {
     assert(file_options_);
     fo_copy = *file_options_;
+    fo_copy.open_contract = FileOpenContract::kNoReopenForWrite |
+                            FileOpenContract::kNoReadersWhileOpenForWrite;
     fo_copy.write_hint = write_hint_;
     Status s = NewWritableFile(fs_, blob_file_path, &file, fo_copy);
 

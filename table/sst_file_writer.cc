@@ -80,6 +80,16 @@ struct SstFileWriter::Rep {
       return builder->status();
     }
 
+    // user_key + kNumInternalBytes must fit in uint32_t (BlockBuilder
+    // assumption). Also check value size.
+    if (user_key.size() >
+        size_t{std::numeric_limits<uint32_t>::max()} - kNumInternalBytes) {
+      return Status::InvalidArgument("key is too large");
+    }
+    if (value.size() > size_t{std::numeric_limits<uint32_t>::max()}) {
+      return Status::InvalidArgument("value is too large");
+    }
+
     assert(user_key.size() >= ts_sz);
     if (strip_timestamp) {
       // In this mode, we expect users to always provide a min timestamp.
@@ -172,6 +182,16 @@ struct SstFileWriter::Rep {
   Status DeleteRangeImpl(const Slice& begin_key, const Slice& end_key) {
     if (!builder) {
       return Status::InvalidArgument("File is not opened");
+    }
+    // begin_key + kNumInternalBytes must fit in uint32_t (BlockBuilder
+    // assumption). end_key is stored as the value in the range deletion
+    // block, so it only needs to fit in uint32_t.
+    if (begin_key.size() >
+        size_t{std::numeric_limits<uint32_t>::max()} - kNumInternalBytes) {
+      return Status::InvalidArgument("key is too large");
+    }
+    if (end_key.size() > size_t{std::numeric_limits<uint32_t>::max()}) {
+      return Status::InvalidArgument("end key is too large");
     }
     int cmp = internal_comparator.user_comparator()->CompareWithoutTimestamp(
         begin_key, end_key);
@@ -330,6 +350,8 @@ Status SstFileWriter::Open(const std::string& file_path, Temperature temp) {
   std::unique_ptr<FSWritableFile> sst_file;
   FileOptions cur_file_opts(r->env_options);
   cur_file_opts.temperature = temp;
+  cur_file_opts.open_contract = FileOpenContract::kNoReopenForWrite |
+                                FileOpenContract::kNoReadersWhileOpenForWrite;
   s = r->ioptions.env->GetFileSystem()->NewWritableFile(
       file_path, cur_file_opts, &sst_file, nullptr);
   if (!s.ok()) {

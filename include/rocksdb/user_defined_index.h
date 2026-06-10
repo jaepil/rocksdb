@@ -43,7 +43,7 @@ class UserDefinedIndexBuilder {
     kOther = 3,   // Other types (e.g., blob reference, wide-column entity).
                   // The value format is type-specific and may not be the
                   // actual user data.
-    kTypeMax,     // Sentinel — must be last. Value may change across releases.
+    kTypeMax,     // Sentinel -- must be last. Value may change across releases.
   };
 
   // File offset and size of the data block
@@ -106,7 +106,7 @@ class UserDefinedIndexBuilder {
   // (e.g., trie-based indexes) can leave this as a no-op.
   //
   // @key:   The user key (without sequence number or type suffix).
-  // @type:  The entry type — kValue (Put), kDelete, kMerge, or kOther.
+  // @type:  The entry type -- kValue (Put), kDelete, kMerge, or kOther.
   //         For kDelete entries, the value may be empty. For kOther, the
   //         value format is type-specific and may not be actual user data.
   // @value: The associated value (may be empty for deletions).
@@ -127,6 +127,9 @@ class UserDefinedIndexBuilder {
   // The memory backing the contents should not be freed until this builder
   // object is destructed.
   virtual Status Finish(Slice* index_contents) = 0;
+
+  // Returns an estimate of the current serialized index size in bytes.
+  virtual uint64_t EstimatedSize() const = 0;
 };
 
 // The interface for iterating the user defined index. This will be

@@ -52,7 +52,7 @@ GRTAGS
 GTAGS
 rocksdb_dump
 rocksdb_undump
-db_test2
+db_etc2_test
 trace_analyzer
 block_cache_trace_analyzer
 io_tracer_parser
@@ -102,3 +102,11 @@ cmake-build-*
 third-party/folly/
 .cache
 *.sublime-*
+
+# Claude Code local settings
+.claude/settings.local.json
+
+tools/__pycache__/
+# Keep documentation trackable even if broader ignores match names like "*_test".
+!docs/
+!docs/**

@@ -17,6 +17,7 @@
 #include "file/file_util.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
+#include "monitoring/statistics_impl.h"
 #include "table/merging_iterator.h"
 #include "table/sst_file_writer_collectors.h"
 #include "table/table_builder.h"
@@ -164,35 +165,21 @@ Status ExternalSstFileIngestionJob::Prepare(
         // It is unsafe to assume application had sync the file and file
         // directory before ingest the file. For integrity of RocksDB we need
         // to sync the file.
-
-        // TODO(xingbo), We should in general be moving away from production
-        // uses of ReuseWritableFile (except explicitly for WAL recycling),
-        // ReopenWritableFile, and NewRandomRWFile. We should create a
-        // FileSystem::SyncFile/FsyncFile API that by default does the
-        // re-open+sync+close combo but can (a) be reused easily, and (b) be
-        // overridden to do that more cleanly, e.g. in EncryptedEnv.
-        // https://github.com/facebook/rocksdb/issues/13741
-        std::unique_ptr<FSWritableFile> file_to_sync;
-        Status s = fs_->ReopenWritableFile(path_inside_db, env_options_,
-                                           &file_to_sync, nullptr);
-        TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::Prepare:Reopen",
-                                 &s);
+        TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
+        Status s = fs_->SyncFile(path_inside_db, env_options_, IOOptions(),
+                                 db_options_.use_fsync, nullptr);
+        TEST_SYNC_POINT("ExternalSstFileIngestionJob::AfterSyncIngestedFile");
+        TEST_SYNC_POINT_CALLBACK(
+            "ExternalSstFileIngestionJob::CheckSyncReturnCode", &s);
         // Some file systems (especially remote/distributed) don't support
-        // reopening a file for writing and don't require reopening and
-        // syncing the file. Ignore the NotSupported error in that case.
+        // explicitly syncing the file and don't require it. Ignore the
+        // NotSupported error in that case.
         if (!s.IsNotSupported()) {
           status = s;
-          if (status.ok()) {
-            TEST_SYNC_POINT(
-                "ExternalSstFileIngestionJob::BeforeSyncIngestedFile");
-            status = SyncIngestedFile(file_to_sync.get());
-            TEST_SYNC_POINT(
-                "ExternalSstFileIngestionJob::AfterSyncIngestedFile");
-            if (!status.ok()) {
-              ROCKS_LOG_WARN(db_options_.info_log,
-                             "Failed to sync ingested file %s: %s",
-                             path_inside_db.c_str(), status.ToString().c_str());
-            }
+          if (!status.ok()) {
+            ROCKS_LOG_WARN(db_options_.info_log,
+                           "Failed to sync ingested file %s: %s",
+                           path_inside_db.c_str(), status.ToString().c_str());
           }
         }
       } else if (status.IsNotSupported() &&
@@ -719,6 +706,34 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     // This ensures ingested files have proper timestamp ranges in FileMetaData,
     // similar to files created by flush and compaction.
     ExtractTimestampFromTableProperties(file->table_properties, &f_metadata);
+    // Retrieve file open metadata for fast SST open
+    if (mutable_db_options_.fast_sst_open) {
+      std::unique_ptr<FSRandomAccessFile> readable_file;
+      FileOptions fopts{env_options_};
+      fopts.file_checksum = f_metadata.file_checksum;
+      fopts.file_checksum_func_name = f_metadata.file_checksum_func_name;
+      IOStatus io_s = fs_->NewRandomAccessFile(file->internal_file_path, fopts,
+                                               &readable_file, nullptr);
+      if (io_s.ok()) {
+        io_s =
+            readable_file->GetFileOpenMetadata(&f_metadata.file_open_metadata);
+        if (io_s.ok() && !f_metadata.file_open_metadata.empty() &&
+            f_metadata.file_open_metadata.size() <=
+                FSRandomAccessFile::kMaxFileOpenMetadataSize) {
+          RecordTick(db_options_.stats, FILE_OPEN_METADATA_RETRIEVED);
+        } else {
+          if (io_s.ok() && f_metadata.file_open_metadata.size() >
+                               FSRandomAccessFile::kMaxFileOpenMetadataSize) {
+            ROCKS_LOG_WARN(db_options_.info_log,
+                           "File open metadata for %s too large (%zu bytes), "
+                           "ignoring",
+                           file->internal_file_path.c_str(),
+                           f_metadata.file_open_metadata.size());
+          }
+          f_metadata.file_open_metadata.clear();
+        }
+      }
+    }
     edit_.AddFile(file->picked_level, f_metadata);
 
     *batch_uppermost_level =

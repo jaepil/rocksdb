@@ -53,6 +53,7 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/io_dispatcher.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/options.h"
 #include "rocksdb/perf_context.h"
@@ -132,6 +133,7 @@ DEFINE_string(
     "waitforcompaction,"
     "multireadrandom,"
     "multiscan,"
+    "multiscanrandom,"
     "mixgraph,"
     "readseq,"
     "readtorowcache,"
@@ -217,6 +219,10 @@ DEFINE_string(
     "\txxhash        -- repeated xxHash of <block size> data\n"
     "\txxhash64      -- repeated xxHash64 of <block size> data\n"
     "\txxh3          -- repeated XXH3 of <block size> data\n"
+    "\tcompressreject -- repeated compression of <block size> data forced to "
+    "be rejected (output buffer ~10% of input smaller than the predicted "
+    "compressed size), to measure the cost of attempting then declining "
+    "compression\n"
     "\tacquireload   -- load N*1000 times\n"
     "\tfillseekseq   -- write N values in sequential key, then read "
     "them by seeking to each key\n"
@@ -262,6 +268,15 @@ DEFINE_string(
     "after fillrandom, where actual answer is batch_size");
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
+
+DEFINE_int64(bgwriter_num, 0,
+             "If > 0, the background-writer thread used by readwhilewriting / "
+             "readwhilemerging / multireadwhilewriting writes random keys over "
+             "[0, bgwriter_num) instead of [0, num). Lets the reader thread "
+             "group operate on a small hot subset (--num) while the writer "
+             "spreads its puts across a much larger keyspace, which is what "
+             "drives continuous flushes and compaction. Designed for "
+             "benchmarking compaction-time effects on user reads.");
 
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
@@ -325,6 +340,11 @@ DEFINE_int32(seek_nexts, 0,
              "How many times to call Next() after Seek() in "
              "fillseekseq, seekrandom, seekrandomwhilewriting and "
              "seekrandomwhilemerging");
+
+DEFINE_int32(seek_nexts_to_delete, 0,
+             "After completing seek_nexts iterations in seekrandom, delete "
+             "this many subsequent keys via point deletes. Useful for "
+             "benchmarking read-path range tombstone insertion.");
 
 DEFINE_bool(reverse_iterator, false,
             "When true use Prev rather than Next for iterators that do "
@@ -1098,6 +1118,25 @@ DEFINE_bool(
     ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().enable_blob_files,
     "[Integrated BlobDB] Enable writing large values to separate blob files.");
 
+DEFINE_bool(
+    enable_blob_direct_write,
+    ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().enable_blob_direct_write,
+    "[Integrated BlobDB] Enable direct-write blob file creation on "
+    "the write path.");
+
+DEFINE_uint64(blob_direct_write_partitions,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .blob_direct_write_partitions,
+              "[Integrated BlobDB] Number of partitions for direct-write blob "
+              "files.");
+
+static void RegisterDbBenchBdwFlagValidators() {
+  static const bool blob_direct_write_partitions_validator_registered =
+      RegisterFlagValidator(&FLAGS_blob_direct_write_partitions,
+                            &ValidateUint32Range);
+  (void)blob_direct_write_partitions_validator_registered;
+}
+
 DEFINE_uint64(min_blob_size,
               ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().min_blob_size,
               "[Integrated BlobDB] The size of the smallest value to be stored "
@@ -1312,8 +1351,8 @@ DEFINE_bool(
 DEFINE_bool(paranoid_memory_checks, false,
             "Sets CF option paranoid_memory_checks");
 
-DEFINE_bool(memtable_veirfy_per_key_checksum_on_seek, false,
-            "Sets CF option memtable_veirfy_per_key_checksum_on_seek");
+DEFINE_bool(memtable_verify_per_key_checksum_on_seek, false,
+            "Sets CF option memtable_verify_per_key_checksum_on_seek");
 
 DEFINE_bool(
     auto_refresh_iterator_with_snapshot, false,
@@ -1328,6 +1367,11 @@ DEFINE_uint32(memtable_op_scan_flush_trigger,
               ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
                   .memtable_op_scan_flush_trigger,
               "Setting for CF option memtable_op_scan_flush_trigger.");
+
+DEFINE_uint32(min_tombstones_for_range_conversion,
+              ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+                  .min_tombstones_for_range_conversion,
+              "Setting for CF option min_tombstones_for_range_conversion.");
 
 DEFINE_bool(verify_compression, false,
             "See BlockBasedTableOptions::verify_compression");
@@ -1683,6 +1727,11 @@ DEFINE_bool(mmap_write, ROCKSDB_NAMESPACE::Options().allow_mmap_writes,
 DEFINE_bool(use_direct_reads, ROCKSDB_NAMESPACE::Options().use_direct_reads,
             "Use O_DIRECT for reading data");
 
+DEFINE_bool(use_direct_io_for_compaction_reads,
+            ROCKSDB_NAMESPACE::Options().use_direct_io_for_compaction_reads,
+            "Use O_DIRECT for compaction-input SST reads only, while keeping "
+            "user reads buffered");
+
 DEFINE_bool(use_direct_io_for_flush_and_compaction,
             ROCKSDB_NAMESPACE::Options().use_direct_io_for_flush_and_compaction,
             "Use O_DIRECT for background flush and compaction writes");
@@ -1885,6 +1934,8 @@ DEFINE_bool(track_and_verify_wals_in_manifest, false,
 
 DEFINE_bool(track_and_verify_wals, false, "See Options.track_and_verify_wals");
 
+DEFINE_bool(async_wal_precreate, false, "See Options.async_wal_precreate");
+
 DEFINE_int32(same_value_percentage, 0,
              "Percentage of time value will be same i.e good for compression "
              "of the block");
@@ -1905,6 +1956,23 @@ DEFINE_bool(
     ROCKSDB_NAMESPACE::MultiScanArgs(ROCKSDB_NAMESPACE::BytewiseComparator())
         .use_async_io,
     "Sets MultiScanArgs::use_async_io");
+
+DEFINE_uint64(io_dispatcher_max_prefetch_memory_bytes, 0,
+              "Maximum memory (in bytes) for IODispatcher prefetching across "
+              "all ReadSets. When this limit is reached, SubmitJob() blocks "
+              "until memory is released. 0 means unlimited.");
+
+DEFINE_uint64(
+    multiscan_max_prefetch_size,
+    ROCKSDB_NAMESPACE::MultiScanArgs(ROCKSDB_NAMESPACE::BytewiseComparator())
+        .max_prefetch_size,
+    "Maximum per-file prefetch size (in bytes) for MultiScan. "
+    "Limits cumulative compressed data block size pinned per SST file. "
+    "0 means unlimited.");
+
+DEFINE_bool(use_multiscan, true,
+            "If true, multiscanrandom uses MultiScan API. If false, uses "
+            "normal iterators (Seek + Next) for each range.");
 
 DEFINE_bool(openandcompact_allow_resumption, false,
             "Whether to keep existing progress and enable resume compaction in "
@@ -2862,6 +2930,44 @@ class Benchmark {
   std::shared_ptr<const SliceTransform> prefix_extractor_;
   DBWithColumnFamilies db_;
   std::vector<DBWithColumnFamilies> multi_dbs_;
+  //
+  // === DB lifetime protocol ===
+  //
+  // Two RAII guards protect db_, multi_dbs_, and secondary_update_thread_:
+  //
+  //  - DbUseGuard:           held by any thread that reads or holds a raw
+  //                          DBWithColumnFamilies* derived from db_ /
+  //                          multi_dbs_, for the entire scope of use. Takes a
+  //                          read lock on db_lifecycle_rwlock_.
+  //                          STRICT enforcement at the SelectDBWithCfh entry
+  //                          point (assert on holds_db_use_guard_).
+  //                          Direct field accesses elsewhere (e.g.
+  //                          db_.db->NewIterator) are protected by the outer
+  //                          DbUseGuard that ThreadBody installs for workers,
+  //                          or by main-thread serialization -- but are not
+  //                          mechanically asserted per-site.
+  //
+  //  - DbStateMutationGuard: held by any thread that mutates db_, multi_dbs_,
+  //                          or secondary_update_thread_. Takes a write lock
+  //                          on db_lifecycle_rwlock_, then stops the secondary
+  //                          update thread before mutation may proceed.
+  //                          STRICT enforcement at DeleteDBs (assert on
+  //                          holds_db_state_mutation_guard_). Direct calls
+  //                          to DBWithColumnFamilies::DeleteDBs() and
+  //                          multi_dbs_.clear() in the fresh-DB reopen branch
+  //                          are protected by being inside the same guard
+  //                          scope, but not mechanically asserted.
+  //
+  // Three thread-locals, each with a single meaning:
+  //  - holds_db_use_guard_            : in DbUseGuard scope
+  //  - holds_db_state_mutation_guard_ : in DbStateMutationGuard scope
+  //  - is_secondary_update_thread_    : this thread is the secondary updater
+  //
+  // ErrorExit consults the first and third: a thread in *either* state
+  // cannot safely run the mutation cleanup path (self-wait or self-join
+  // respectively), so it takes std::_Exit(1) instead.
+  //
+  port::RWMutex db_lifecycle_rwlock_;
   int64_t num_;
   int key_size_;
   int user_timestamp_size_;
@@ -3452,6 +3558,11 @@ class Benchmark {
   }
 
   void DeleteDBs() {
+    // Caller MUST hold DbStateMutationGuard (proven by ownership flag).
+    // Note: direct calls to db_.DeleteDBs() / multi_dbs_[i].DeleteDBs() in
+    // the fresh-DB reopen branch bypass this wrapper; they're protected by
+    // being inside DbStateMutationGuard but are not mechanically asserted.
+    assert(holds_db_state_mutation_guard_);
     db_.DeleteDBs();
     for (auto& dbwcf : multi_dbs_) {
       dbwcf.DeleteDBs();
@@ -3459,7 +3570,10 @@ class Benchmark {
   }
 
   ~Benchmark() {
-    DeleteDBs();
+    {
+      DbStateMutationGuard mutation(this);
+      DeleteDBs();
+    }
     if (cache_.get() != nullptr) {
       // Clear cache reference first
       open_options_.write_buffer_manager.reset();
@@ -3593,7 +3707,19 @@ class Benchmark {
   }
 
   void ErrorExit() {
-    DeleteDBs();
+    if (holds_db_use_guard_ || is_secondary_update_thread_) {
+      // Neither kind of DB-user context can safely run the mutation cleanup
+      // path:
+      //   - DbUseGuard holder would self-wait on the write lock
+      //   - secondary update thread would self-join via
+      //     StopSecondaryUpdateThread()
+      // Terminate immediately and let the OS reclaim resources.
+      std::_Exit(1);
+    }
+    {
+      DbStateMutationGuard mutation(this);
+      DeleteDBs();
+    }
     db_bench_exit(1);
   }
 
@@ -3768,7 +3894,29 @@ class Benchmark {
                 FLAGS_multiscan_stride);
         fprintf(stderr, "multiscan_size = %" PRIi64 "\n", FLAGS_multiscan_size);
         fprintf(stderr, "seek_nexts = %" PRIi32 "\n", FLAGS_seek_nexts);
+        fprintf(stderr,
+                "io_dispatcher_max_prefetch_memory_bytes = %" PRIu64 "\n",
+                FLAGS_io_dispatcher_max_prefetch_memory_bytes);
+        fprintf(stderr, "multiscan_max_prefetch_size = %" PRIu64 "\n",
+                FLAGS_multiscan_max_prefetch_size);
         method = &Benchmark::MultiScan;
+      } else if (name == "multiscanrandom") {
+        int64_t max_range_keys = std::max<int64_t>(
+            1, (1 << 20) / (FLAGS_key_size + FLAGS_value_size));
+        fprintf(stderr,
+                "multiscanrandom: batch_size=1..64, "
+                "max_range_keys=%" PRIi64 "\n",
+                max_range_keys);
+        fprintf(stderr,
+                "io_dispatcher_max_prefetch_memory_bytes = %" PRIu64 "\n",
+                FLAGS_io_dispatcher_max_prefetch_memory_bytes);
+        fprintf(stderr, "multiscan_max_prefetch_size = %" PRIu64 "\n",
+                FLAGS_multiscan_max_prefetch_size);
+        fprintf(stderr, "multiscan_use_async_io = %s\n",
+                FLAGS_multiscan_use_async_io ? "true" : "false");
+        fprintf(stderr, "use_multiscan = %s\n",
+                FLAGS_use_multiscan ? "true" : "false");
+        method = &Benchmark::MultiScanRandom;
       } else if (name == "multireadwhilewriting") {
         fprintf(stderr, "entries_per_batch = %" PRIi64 "\n",
                 entries_per_batch_);
@@ -3864,6 +4012,8 @@ class Benchmark {
         method = &Benchmark::AcquireLoad;
       } else if (name == "compress") {
         method = &Benchmark::Compress;
+      } else if (name == "compressreject") {
+        method = &Benchmark::CompressReject;
       } else if (name == "uncompress") {
         method = &Benchmark::Uncompress;
       } else if (name == "randomtransaction") {
@@ -3938,6 +4088,7 @@ class Benchmark {
       }
 
       if (fresh_db) {
+        DbStateMutationGuard mutation(this);
         if (FLAGS_use_existing_db) {
           fprintf(stdout, "%-12s : skipped (--use_existing_db is true)\n",
                   name.c_str());
@@ -4065,11 +4216,7 @@ class Benchmark {
       }
     }
 
-    if (secondary_update_thread_) {
-      secondary_update_stopped_.store(1, std::memory_order_relaxed);
-      secondary_update_thread_->join();
-      secondary_update_thread_.reset();
-    }
+    StopSecondaryUpdateThread();
 
     if (name != "replay" && FLAGS_trace_file != "") {
       Status s = db_.db->EndTrace();
@@ -4107,6 +4254,83 @@ class Benchmark {
   std::unique_ptr<port::Thread> secondary_update_thread_;
   std::atomic<int> secondary_update_stopped_{0};
   uint64_t secondary_db_updates_ = 0;
+  void StopSecondaryUpdateThread() {
+    if (secondary_update_thread_) {
+      secondary_update_stopped_.store(1, std::memory_order_relaxed);
+      secondary_update_thread_->join();
+      secondary_update_thread_.reset();
+      secondary_update_stopped_.store(0, std::memory_order_relaxed);
+    }
+  }
+
+  // True iff the current thread is inside a DbUseGuard scope.
+  // Set/cleared only by DbUseGuard. Strict guard ownership.
+  static thread_local bool holds_db_use_guard_;
+
+  // True iff the current thread is inside a DbStateMutationGuard scope.
+  // Set/cleared only by DbStateMutationGuard.
+  static thread_local bool holds_db_state_mutation_guard_;
+
+  // True iff the current thread is the secondary update thread.
+  // The secondary thread reads its captured DBWithColumnFamilies* without
+  // going through DbUseGuard or SelectDBWithCfh. This flag exists so
+  // ErrorExit can route it to _Exit(1) without self-joining via
+  // StopSecondaryUpdateThread.
+  static thread_local bool is_secondary_update_thread_;
+
+  class DbUseGuard {
+   public:
+    explicit DbUseGuard(Benchmark* bm)
+        : lock_(CheckDbUsePreconditionsAndGetLock(bm)) {
+      holds_db_use_guard_ = true;
+    }
+    ~DbUseGuard() {
+      assert(holds_db_use_guard_);
+      holds_db_use_guard_ = false;
+    }
+    DbUseGuard(const DbUseGuard&) = delete;
+    DbUseGuard& operator=(const DbUseGuard&) = delete;
+    DbUseGuard(DbUseGuard&&) = delete;
+    DbUseGuard& operator=(DbUseGuard&&) = delete;
+
+   private:
+    static port::RWMutex* CheckDbUsePreconditionsAndGetLock(Benchmark* bm) {
+      assert(!holds_db_use_guard_);
+      return &bm->db_lifecycle_rwlock_;
+    }
+
+    ReadLock lock_;
+  };
+
+  class DbStateMutationGuard {
+   public:
+    explicit DbStateMutationGuard(Benchmark* bm)
+        : bm_(bm), lock_(CheckDbMutationPreconditionsAndGetLock(bm)) {
+      bm_->StopSecondaryUpdateThread();
+      holds_db_state_mutation_guard_ = true;
+    }
+    ~DbStateMutationGuard() {
+      assert(holds_db_state_mutation_guard_);
+      holds_db_state_mutation_guard_ = false;
+    }
+    DbStateMutationGuard(const DbStateMutationGuard&) = delete;
+    DbStateMutationGuard& operator=(const DbStateMutationGuard&) = delete;
+    DbStateMutationGuard(DbStateMutationGuard&&) = delete;
+    DbStateMutationGuard& operator=(DbStateMutationGuard&&) = delete;
+
+   private:
+    static port::RWMutex* CheckDbMutationPreconditionsAndGetLock(
+        Benchmark* bm) {
+      assert(!holds_db_state_mutation_guard_);
+      assert(!holds_db_use_guard_);
+      assert(!is_secondary_update_thread_);
+      return &bm->db_lifecycle_rwlock_;
+    }
+
+    Benchmark* bm_;
+    WriteLock lock_;
+  };
+
   struct ThreadArg {
     Benchmark* bm;
     SharedState* shared;
@@ -4132,7 +4356,10 @@ class Benchmark {
     SetPerfLevel(static_cast<PerfLevel>(shared->perf_level));
     perf_context.EnablePerLevelPerfContext();
     thread->stats.Start(thread->tid);
-    (arg->bm->*(arg->method))(thread);
+    {
+      DbUseGuard db_guard(arg->bm);
+      (arg->bm->*(arg->method))(thread);
+    }
     if (FLAGS_perf_level > ROCKSDB_NAMESPACE::PerfLevel::kDisable) {
       thread->stats.AddMessage(std::string("PERF_CONTEXT:\n") +
                                get_perf_context()->ToString());
@@ -4299,8 +4526,8 @@ class Benchmark {
     auto working_area = compressor->ObtainWorkingArea();
 
     GrowableBuffer compressed;
-    // Compress 1G
-    while (bytes < int64_t(1) << 30) {
+    // Compress 3G
+    while (bytes < int64_t(3) << 30) {
       compressed.ResetForSize(input.size());
       CompressionType actual_type = kNoCompression;
       s = compressor->CompressBlock(input, compressed.data(),
@@ -4324,6 +4551,68 @@ class Benchmark {
       char buf[340];
       snprintf(buf, sizeof(buf), "(output: %.1f%%)",
                (produced * 100.0) / bytes);
+      thread->stats.AddMessage(buf);
+      thread->stats.AddBytes(bytes);
+    }
+  }
+
+  // Like Compress, but forces every block's compression to be rejected by
+  // giving the compressor an output buffer slightly smaller than the data is
+  // expected to compress to. This exercises (and measures the speed of) the
+  // path that attempts compression but falls back to storing data uncompressed,
+  // as happens for incompressible data.
+  void CompressReject(ThreadState* thread) {
+    RandomGenerator gen;
+    Slice input = gen.Generate(FLAGS_block_size);
+    int64_t bytes = 0;
+    Status s;
+
+    auto compressor = GetCompressor();
+    if (!compressor) {
+      thread->stats.AddMessage("(compression type not supported)");
+      return;
+    }
+    auto working_area = compressor->ObtainWorkingArea();
+
+    // RandomGenerator produces data that compresses to about
+    // FLAGS_compression_ratio of its original size (see CompressibleString),
+    // which should be an accurate/optimistic predictor of the compressed size.
+    // Make the output buffer 10% of the uncompressed size smaller than that
+    // predicted compressed size, so the real output won't fit and compression
+    // is rejected on every call. Clamp to at least 1 byte, which should always
+    // reject.
+    double reject_fraction = std::max(0.0, FLAGS_compression_ratio - 0.10);
+    size_t reject_size = std::max<size_t>(
+        1, static_cast<size_t>(reject_fraction * input.size()));
+
+    GrowableBuffer compressed;
+
+    // Compress 3G
+    while (bytes < int64_t(3) << 30) {
+      compressed.ResetForSize(reject_size);
+      CompressionType actual_type = kNoCompression;
+      s = compressor->CompressBlock(input, compressed.data(),
+                                    &compressed.MutableSize(), &actual_type,
+                                    &working_area);
+      if (UNLIKELY(!s.ok())) {
+        break;
+      }
+      if (UNLIKELY(actual_type != kNoCompression)) {
+        s = Status::Aborted(
+            "Compression unexpectedly not rejected; try a smaller "
+            "compression_ratio");
+        break;
+      }
+      bytes += input.size();
+      thread->stats.FinishedOps(nullptr, nullptr, 1, kCompress);
+    }
+
+    if (!s.ok()) {
+      thread->stats.AddMessage("(compression failure: " + s.ToString() + ")");
+    } else {
+      char buf[340];
+      snprintf(buf, sizeof(buf), "(rejected; output buffer %.1f%% of input)",
+               (reject_size * 100.0) / input.size());
       thread->stats.AddMessage(buf);
       thread->stats.AddBytes(bytes);
     }
@@ -4361,8 +4650,9 @@ class Benchmark {
             actual_type);
     auto decomp_working_area = decompressor->ObtainWorkingArea(actual_type);
 
-    int64_t bytes = 0;
-    while (bytes < 1024 * 1048576) {
+    uint64_t bytes = 0;
+    // Decompress 20GB
+    while (bytes < uint64_t{20} * 1024U * 1048576U) {
       Decompressor::Args args;
       args.compression_type = actual_type;
       args.compressed_data = compressed.AsSlice();
@@ -4474,6 +4764,8 @@ class Benchmark {
     options.allow_mmap_reads = FLAGS_mmap_read;
     options.allow_mmap_writes = FLAGS_mmap_write;
     options.use_direct_reads = FLAGS_use_direct_reads;
+    options.use_direct_io_for_compaction_reads =
+        FLAGS_use_direct_io_for_compaction_reads;
     options.use_direct_io_for_flush_and_compaction =
         FLAGS_use_direct_io_for_flush_and_compaction;
     options.manual_wal_flush = FLAGS_manual_wal_flush;
@@ -4993,9 +5285,13 @@ class Benchmark {
     options.track_and_verify_wals_in_manifest =
         FLAGS_track_and_verify_wals_in_manifest;
     options.track_and_verify_wals = FLAGS_track_and_verify_wals;
+    options.async_wal_precreate = FLAGS_async_wal_precreate;
 
     // Integrated BlobDB
     options.enable_blob_files = FLAGS_enable_blob_files;
+    options.enable_blob_direct_write = FLAGS_enable_blob_direct_write;
+    options.blob_direct_write_partitions =
+        static_cast<uint32_t>(FLAGS_blob_direct_write_partitions);
     options.min_blob_size = FLAGS_min_blob_size;
     options.blob_file_size = FLAGS_blob_file_size;
     options.blob_compression_type =
@@ -5026,10 +5322,12 @@ class Benchmark {
     options.block_protection_bytes_per_key =
         FLAGS_block_protection_bytes_per_key;
     options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
-    options.memtable_veirfy_per_key_checksum_on_seek =
-        FLAGS_memtable_veirfy_per_key_checksum_on_seek;
+    options.memtable_verify_per_key_checksum_on_seek =
+        FLAGS_memtable_verify_per_key_checksum_on_seek;
     options.memtable_op_scan_flush_trigger =
         FLAGS_memtable_op_scan_flush_trigger;
+    options.min_tombstones_for_range_conversion =
+        FLAGS_min_tombstones_for_range_conversion;
     options.compaction_options_universal.reduce_file_locking =
         FLAGS_universal_reduce_file_locking;
   }
@@ -5304,6 +5602,7 @@ class Benchmark {
       if (s.ok() && FLAGS_secondary_update_interval > 0) {
         secondary_update_thread_.reset(new port::Thread(
             [this](int interval, DBWithColumnFamilies* _db) {
+              is_secondary_update_thread_ = true;
               while (0 == secondary_update_stopped_.load(
                               std::memory_order_relaxed)) {
                 Status secondary_update_status =
@@ -5616,6 +5915,10 @@ class Benchmark {
   }
 
   DBWithColumnFamilies* SelectDBWithCfh(uint64_t rand_int) {
+    // Caller MUST hold DbUseGuard (proven by ownership flag). The secondary
+    // update thread does not call this function; it uses its captured
+    // DBWithColumnFamilies* directly.
+    assert(holds_db_use_guard_);
     if (db_.db != nullptr) {
       return &db_;
     } else {
@@ -6802,6 +7105,18 @@ class Benchmark {
     thread->stats.AddMessage(msg);
   }
 
+  std::shared_ptr<IODispatcher> MaybeCreateIODispatcher() {
+    std::shared_ptr<IODispatcher> io_dispatcher;
+    if (FLAGS_io_dispatcher_max_prefetch_memory_bytes > 0) {
+      IODispatcherOptions disp_opts;
+      disp_opts.max_prefetch_memory_bytes =
+          FLAGS_io_dispatcher_max_prefetch_memory_bytes;
+      disp_opts.statistics = dbstats.get();
+      io_dispatcher.reset(NewIODispatcher(disp_opts));
+    }
+    return io_dispatcher;
+  }
+
   void MultiScan(ThreadState* thread) {
     const int64_t scan_size = FLAGS_seek_nexts ? FLAGS_seek_nexts : 50;
     const int64_t readahead =
@@ -6815,6 +7130,8 @@ class Benchmark {
     options.async_io = true;
     options.readahead_size = readahead;
 
+    auto io_dispatcher = MaybeCreateIODispatcher();
+
     Duration duration(FLAGS_duration, reads_);
     int64_t num_keys = 1;
     while (!duration.Done(num_keys)) {
@@ -6822,6 +7139,10 @@ class Benchmark {
       MultiScanArgs opts(open_options_.comparator);
       opts.io_coalesce_threshold = FLAGS_multiscan_coalesce_threshold;
       opts.use_async_io = FLAGS_multiscan_use_async_io;
+      opts.max_prefetch_size = FLAGS_multiscan_max_prefetch_size;
+      if (io_dispatcher) {
+        opts.io_dispatcher = io_dispatcher;
+      }
       std::vector<std::unique_ptr<const char[]>> guards;
       opts.reserve(multiscan_size);
       // We create 1 random start, and then multiscan will start from that
@@ -6849,11 +7170,15 @@ class Benchmark {
       auto iter =
           db->NewMultiScan(read_options_, db->DefaultColumnFamily(), opts);
       int64_t keys = 0;
-      for (auto rng : *iter) {
-        for ([[maybe_unused]] auto it : rng) {
-          keys++;
+      try {
+        for (auto rng : *iter) {
+          for ([[maybe_unused]] auto it : rng) {
+            keys++;
+          }
+          assert(keys > 0);
         }
-        assert(keys > 0);
+      } catch (const MultiScanException& e) {
+        fprintf(stderr, "MultiScanException: %s\n", e.what());
       }
       num_keys = std::max<int64_t>(1, keys);
 
@@ -6867,7 +7192,155 @@ class Benchmark {
     }
 
     char msg[100];
-    snprintf(msg, sizeof(msg), "(multscans:%" PRIu64 ")", multiscans_done);
+    snprintf(msg, sizeof(msg), "(multiscans:%" PRIu64 ")", multiscans_done);
+    thread->stats.AddMessage(msg);
+  }
+
+  void MultiScanRandom(ThreadState* thread) {
+    // Compute max keys per range from 1MB limit and per-key size
+    const int64_t kMaxRangeBytes = 1 << 20;  // 1MB
+    const int64_t per_key_size = FLAGS_key_size + FLAGS_value_size;
+    const int64_t max_range_keys =
+        std::max<int64_t>(1, kMaxRangeBytes / per_key_size);
+    const int64_t kMaxBatchSize = 64;
+
+    std::shared_ptr<IODispatcher> io_dispatcher;
+    if (FLAGS_use_multiscan) {
+      io_dispatcher = MaybeCreateIODispatcher();
+    }
+
+    int64_t multiscans_done = 0;
+    Duration duration(FLAGS_duration, reads_);
+    int64_t num_keys = 1;
+    while (!duration.Done(num_keys)) {
+      DB* db = SelectDB(thread);
+
+      // Random batch size: 1 to kMaxBatchSize
+      int64_t batch_size =
+          1 + static_cast<int64_t>(thread->rand.Uniform(kMaxBatchSize));
+
+      // Generate sorted non-overlapping ranges with random sizes
+      struct RangeSpec {
+        uint64_t start;
+        uint64_t size;
+      };
+      std::vector<RangeSpec> ranges(batch_size);
+      for (int64_t i = 0; i < batch_size; i++) {
+        ranges[i].size =
+            1 + static_cast<uint64_t>(thread->rand.Uniform(max_range_keys));
+        uint64_t max_start =
+            static_cast<uint64_t>(FLAGS_num) > ranges[i].size
+                ? static_cast<uint64_t>(FLAGS_num) - ranges[i].size
+                : 0;
+        ranges[i].start = thread->rand.Uniform(max_start + 1);
+      }
+
+      // Sort by start key
+      std::sort(ranges.begin(), ranges.end(),
+                [](const RangeSpec& a, const RangeSpec& b) {
+                  return a.start < b.start;
+                });
+
+      // Remove overlaps: trim or skip ranges that overlap with the previous
+      std::vector<RangeSpec> non_overlapping;
+      non_overlapping.reserve(batch_size);
+      for (auto& r : ranges) {
+        if (non_overlapping.empty()) {
+          non_overlapping.push_back(r);
+        } else {
+          uint64_t prev_end =
+              non_overlapping.back().start + non_overlapping.back().size;
+          if (r.start >= prev_end) {
+            non_overlapping.push_back(r);
+          } else if (r.start + r.size > prev_end) {
+            uint64_t new_start = prev_end;
+            uint64_t new_size = r.start + r.size - new_start;
+            non_overlapping.push_back({new_start, new_size});
+          }
+          // else: fully contained, skip
+        }
+      }
+
+      if (non_overlapping.empty()) {
+        continue;
+      }
+
+      int64_t keys = 0;
+      std::vector<std::unique_ptr<const char[]>> guards;
+
+      if (FLAGS_use_multiscan) {
+        // MultiScan path
+        MultiScanArgs opts(open_options_.comparator);
+        opts.io_coalesce_threshold = FLAGS_multiscan_coalesce_threshold;
+        opts.use_async_io = FLAGS_multiscan_use_async_io;
+        opts.max_prefetch_size = FLAGS_multiscan_max_prefetch_size;
+        if (io_dispatcher) {
+          opts.io_dispatcher = io_dispatcher;
+        }
+        opts.reserve(non_overlapping.size());
+
+        for (auto& r : non_overlapping) {
+          std::unique_ptr<const char[]> skey_guard;
+          Slice skey = AllocateKey(&skey_guard);
+          guards.push_back(std::move(skey_guard));
+          std::unique_ptr<const char[]> ekey_guard;
+          Slice ekey = AllocateKey(&ekey_guard);
+          guards.push_back(std::move(ekey_guard));
+
+          GenerateKeyFromInt(r.start, FLAGS_num, &skey);
+          GenerateKeyFromInt(r.start + r.size, FLAGS_num, &ekey);
+          opts.insert(skey, ekey);
+        }
+
+        auto iter =
+            db->NewMultiScan(read_options_, db->DefaultColumnFamily(), opts);
+        try {
+          for (auto rng : *iter) {
+            for ([[maybe_unused]] auto it : rng) {
+              keys++;
+            }
+          }
+        } catch (const MultiScanException& e) {
+          fprintf(stderr, "MultiScanException: %s\n", e.what());
+        }
+      } else {
+        // Normal iterator path: Seek + Next for each range
+        std::unique_ptr<const char[]> skey_guard;
+        Slice skey = AllocateKey(&skey_guard);
+        std::unique_ptr<const char[]> ekey_guard;
+        Slice ekey = AllocateKey(&ekey_guard);
+
+        std::unique_ptr<Iterator> iter(
+            db->NewIterator(read_options_, db->DefaultColumnFamily()));
+        for (auto& r : non_overlapping) {
+          GenerateKeyFromInt(r.start, FLAGS_num, &skey);
+          GenerateKeyFromInt(r.start + r.size, FLAGS_num, &ekey);
+          for (iter->Seek(skey); iter->Valid() && iter->key().compare(ekey) < 0;
+               iter->Next()) {
+            keys++;
+          }
+          if (!iter->status().ok()) {
+            fprintf(stderr, "Iterator error: %s\n",
+                    iter->status().ToString().c_str());
+            break;
+          }
+        }
+      }
+      num_keys = std::max<int64_t>(1, keys);
+
+      if (thread->shared->read_rate_limiter.get() != nullptr) {
+        thread->shared->read_rate_limiter->Request(
+            1, Env::IO_HIGH, nullptr /* stats */, RateLimiter::OpType::kRead);
+      }
+
+      thread->stats.FinishedOps(nullptr, db, 1, kMultiScan);
+      multiscans_done += 1;
+    }
+
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "(multiscans:%" PRIu64 " max_range_keys:%" PRId64 ")",
+             multiscans_done, max_range_keys);
     thread->stats.AddMessage(msg);
   }
 
@@ -7499,6 +7972,25 @@ class Benchmark {
         assert(iter_to_use->status().ok());
       }
 
+      // Delete subsequent keys after the seek+next scan to simulate
+      // workloads that create contiguous point tombstones.
+      if (FLAGS_seek_nexts_to_delete > 0 && iter_to_use->Valid()) {
+        DB* db_to_use =
+            (db_.db != nullptr) ? db_.db : multi_dbs_[db_idx_to_use].db;
+        for (int j = 0; j < FLAGS_seek_nexts_to_delete && iter_to_use->Valid();
+             ++j) {
+          Status s = db_to_use->Delete(WriteOptions(), iter_to_use->key());
+          if (!s.ok()) {
+            fprintf(stderr, "Delete failed: %s\n", s.ToString().c_str());
+          }
+          if (!FLAGS_reverse_iterator) {
+            iter_to_use->Next();
+          } else {
+            iter_to_use->Prev();
+          }
+        }
+      }
+
       if (thread->shared->read_rate_limiter.get() != nullptr &&
           read % 256 == 255) {
         thread->shared->read_rate_limiter->Request(
@@ -7664,7 +8156,11 @@ class Benchmark {
         }
       }
 
-      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      const int64_t bg_keyspace =
+          FLAGS_bgwriter_num > 0 ? FLAGS_bgwriter_num : FLAGS_num;
+      const int64_t num_keys =
+          FLAGS_use_existing_keys ? FLAGS_num : bg_keyspace;
+      GenerateKeyFromInt(thread->rand.Next() % bg_keyspace, num_keys, &key);
       Status s;
 
       Slice val = gen.Generate();
@@ -9218,6 +9714,10 @@ class Benchmark {
   }
 };
 
+thread_local bool Benchmark::holds_db_use_guard_ = false;
+thread_local bool Benchmark::holds_db_state_mutation_guard_ = false;
+thread_local bool Benchmark::is_secondary_update_thread_ = false;
+
 int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ConfigOptions config_options;
@@ -9229,6 +9729,7 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     SetVersionString(GetRocksVersionAsString(true));
     initialized = true;
   }
+  RegisterDbBenchBdwFlagValidators();
   ParseCommandLineFlags(&argc, &argv, true);
   FLAGS_compaction_style_e =
       (ROCKSDB_NAMESPACE::CompactionStyle)FLAGS_compaction_style;
@@ -9324,6 +9825,12 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
     fprintf(stderr,
             "`-use_existing_db` must be true for `-use_existing_keys` to be "
             "settable\n");
+    db_bench_exit(1);
+  }
+  if (FLAGS_use_existing_keys && FLAGS_bgwriter_num > FLAGS_num) {
+    fprintf(stderr,
+            "`-bgwriter_num` must be less than or equal to `-num` when "
+            "`-use_existing_keys` is set\n");
     db_bench_exit(1);
   }
 

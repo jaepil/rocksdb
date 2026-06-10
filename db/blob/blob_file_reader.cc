@@ -12,6 +12,7 @@
 #include "db/blob/blob_log_format.h"
 #include "file/file_prefetch_buffer.h"
 #include "file/filename.h"
+#include "file/read_write_util.h"
 #include "monitoring/statistics_impl.h"
 #include "options/cf_options.h"
 #include "rocksdb/file_system.h"
@@ -20,6 +21,7 @@
 #include "table/format.h"
 #include "table/multiget_context.h"
 #include "test_util/sync_point.h"
+#include "util/aligned_buffer.h"
 #include "util/compression.h"
 #include "util/stop_watch.h"
 
@@ -29,7 +31,7 @@ Status BlobFileReader::Create(
     const ImmutableOptions& immutable_options, const ReadOptions& read_options,
     const FileOptions& file_options, uint32_t column_family_id,
     HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
-    const std::shared_ptr<IOTracer>& io_tracer,
+    const std::shared_ptr<IOTracer>& io_tracer, bool skip_footer_validation,
     std::unique_ptr<BlobFileReader>* blob_file_reader) {
   assert(blob_file_reader);
   assert(!*blob_file_reader);
@@ -40,7 +42,8 @@ Status BlobFileReader::Create(
   {
     const Status s =
         OpenFile(immutable_options, file_options, blob_file_read_hist,
-                 blob_file_number, io_tracer, &file_size, &file_reader);
+                 blob_file_number, io_tracer, &file_size, &file_reader,
+                 /*skip_footer_size_check=*/skip_footer_validation);
     if (!s.ok()) {
       return s;
     }
@@ -61,7 +64,7 @@ Status BlobFileReader::Create(
     }
   }
 
-  {
+  if (!skip_footer_validation) {
     const Status s =
         ReadFooter(file_reader.get(), read_options, file_size, statistics);
     if (!s.ok()) {
@@ -76,9 +79,10 @@ Status BlobFileReader::Create(
         compression_type);
   }
 
-  blob_file_reader->reset(new BlobFileReader(
-      std::move(file_reader), file_size, compression_type,
-      std::move(decompressor), immutable_options.clock, statistics));
+  blob_file_reader->reset(
+      new BlobFileReader(std::move(file_reader), file_size, compression_type,
+                         std::move(decompressor), immutable_options.clock,
+                         statistics, !skip_footer_validation));
 
   return Status::OK();
 }
@@ -87,7 +91,8 @@ Status BlobFileReader::OpenFile(
     const ImmutableOptions& immutable_options, const FileOptions& file_opts,
     HistogramImpl* blob_file_read_hist, uint64_t blob_file_number,
     const std::shared_ptr<IOTracer>& io_tracer, uint64_t* file_size,
-    std::unique_ptr<RandomAccessFileReader>* file_reader) {
+    std::unique_ptr<RandomAccessFileReader>* file_reader,
+    bool skip_footer_size_check) {
   assert(file_size);
   assert(file_reader);
 
@@ -102,33 +107,42 @@ Status BlobFileReader::OpenFile(
 
   constexpr IODebugContext* dbg = nullptr;
 
-  {
-    TEST_SYNC_POINT("BlobFileReader::OpenFile:GetFileSize");
-
-    const Status s =
-        fs->GetFileSize(blob_file_path, IOOptions(), file_size, dbg);
-    if (!s.ok()) {
-      return s;
-    }
-  }
-
-  if (*file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
-    return Status::Corruption("Malformed blob file");
-  }
-
   std::unique_ptr<FSRandomAccessFile> file;
+  FileOptions reader_file_opts = file_opts;
+
+  if (skip_footer_size_check && reader_file_opts.use_direct_reads) {
+    reader_file_opts.use_direct_reads = false;
+  }
 
   {
     TEST_SYNC_POINT("BlobFileReader::OpenFile:NewRandomAccessFile");
 
     const Status s =
-        fs->NewRandomAccessFile(blob_file_path, file_opts, &file, dbg);
+        fs->NewRandomAccessFile(blob_file_path, reader_file_opts, &file, dbg);
     if (!s.ok()) {
       return s;
     }
   }
 
   assert(file);
+
+  {
+    Status s = GetFileSizeFromOpenFileOrPath(
+        file.get(), fs, blob_file_path, file_size, dbg,
+        FileSizeFallback::kNotSupportedOnly,
+        []() { TEST_SYNC_POINT("BlobFileReader::OpenFile:GetFileSize"); });
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  if (!skip_footer_size_check &&
+      *file_size < BlobLogHeader::kSize + BlobLogFooter::kSize) {
+    return Status::Corruption("Malformed blob file");
+  }
+  if (skip_footer_size_check && *file_size < BlobLogHeader::kSize) {
+    return Status::Corruption("Malformed blob file");
+  }
 
   if (immutable_options.advise_random_on_open) {
     file->Hint(FSRandomAccessFile::kRandom);
@@ -153,7 +167,7 @@ Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
 
   Slice header_slice;
   Buffer buf;
-  AlignedBuf aligned_buf;
+  AlignedBuffer direct_io_buffer;
 
   {
     TEST_SYNC_POINT("BlobFileReader::ReadHeader:ReadFromFile");
@@ -163,7 +177,7 @@ Status BlobFileReader::ReadHeader(const RandomAccessFileReader* file_reader,
 
     const Status s =
         ReadFromFile(file_reader, read_options, read_offset, read_size,
-                     statistics, &header_slice, &buf, &aligned_buf);
+                     statistics, &header_slice, &buf, &direct_io_buffer);
     if (!s.ok()) {
       return s;
     }
@@ -204,7 +218,7 @@ Status BlobFileReader::ReadFooter(const RandomAccessFileReader* file_reader,
 
   Slice footer_slice;
   Buffer buf;
-  AlignedBuf aligned_buf;
+  AlignedBuffer direct_io_buffer;
 
   {
     TEST_SYNC_POINT("BlobFileReader::ReadFooter:ReadFromFile");
@@ -214,7 +228,7 @@ Status BlobFileReader::ReadFooter(const RandomAccessFileReader* file_reader,
 
     const Status s =
         ReadFromFile(file_reader, read_options, read_offset, read_size,
-                     statistics, &footer_slice, &buf, &aligned_buf);
+                     statistics, &footer_slice, &buf, &direct_io_buffer);
     if (!s.ok()) {
       return s;
     }
@@ -245,10 +259,11 @@ Status BlobFileReader::ReadFromFile(const RandomAccessFileReader* file_reader,
                                     const ReadOptions& read_options,
                                     uint64_t read_offset, size_t read_size,
                                     Statistics* statistics, Slice* slice,
-                                    Buffer* buf, AlignedBuf* aligned_buf) {
+                                    Buffer* buf,
+                                    AlignedBuffer* direct_io_buffer) {
   assert(slice);
   assert(buf);
-  assert(aligned_buf);
+  assert(direct_io_buffer);
 
   assert(file_reader);
 
@@ -265,15 +280,15 @@ Status BlobFileReader::ReadFromFile(const RandomAccessFileReader* file_reader,
 
   if (file_reader->use_direct_io()) {
     constexpr char* scratch = nullptr;
+    AlignedBufferAllocationContext direct_io_context{direct_io_buffer};
 
     s = file_reader->Read(io_options, read_offset, read_size, slice, scratch,
-                          aligned_buf, &dbg);
+                          &direct_io_context, &dbg);
   } else {
     buf->reset(new char[read_size]);
-    constexpr AlignedBuf* aligned_scratch = nullptr;
 
     s = file_reader->Read(io_options, read_offset, read_size, slice, buf->get(),
-                          aligned_scratch, &dbg);
+                          nullptr, &dbg);
   }
 
   if (!s.ok()) {
@@ -291,13 +306,14 @@ BlobFileReader::BlobFileReader(
     std::unique_ptr<RandomAccessFileReader>&& file_reader, uint64_t file_size,
     CompressionType compression_type,
     std::shared_ptr<Decompressor> decompressor, SystemClock* clock,
-    Statistics* statistics)
+    Statistics* statistics, bool has_footer)
     : file_reader_(std::move(file_reader)),
       file_size_(file_size),
       compression_type_(compression_type),
       decompressor_(std::move(decompressor)),
       clock_(clock),
-      statistics_(statistics) {
+      statistics_(statistics),
+      has_footer_(has_footer) {
   assert(file_reader_);
 }
 
@@ -312,7 +328,8 @@ Status BlobFileReader::GetBlob(
 
   const uint64_t key_size = user_key.size();
 
-  if (!IsValidBlobOffset(offset, key_size, value_size, file_size_)) {
+  if (!IsValidBlobOffset(offset, key_size, value_size, file_size_,
+                         has_footer_)) {
     return Status::Corruption("Invalid blob offset");
   }
 
@@ -335,7 +352,7 @@ Status BlobFileReader::GetBlob(
 
   Slice record_slice;
   Buffer buf;
-  AlignedBuf aligned_buf;
+  AlignedBuffer direct_io_buffer;
 
   bool prefetched = false;
 
@@ -365,7 +382,7 @@ Status BlobFileReader::GetBlob(
     const Status s =
         ReadFromFile(file_reader_.get(), read_options, record_offset,
                      static_cast<size_t>(record_size), statistics_,
-                     &record_slice, &buf, &aligned_buf);
+                     &record_slice, &buf, &direct_io_buffer);
     if (!s.ok()) {
       return s;
     }
@@ -428,7 +445,8 @@ void BlobFileReader::MultiGetBlob(
     const uint64_t offset = req->offset;
     const uint64_t value_size = req->len;
 
-    if (!IsValidBlobOffset(offset, key_size, value_size, file_size_)) {
+    if (!IsValidBlobOffset(offset, key_size, value_size, file_size_,
+                           has_footer_)) {
       *req->status = Status::Corruption("Invalid blob offset");
       continue;
     }
@@ -454,8 +472,15 @@ void BlobFileReader::MultiGetBlob(
 
   RecordTick(statistics_, BLOB_DB_BLOB_FILE_BYTES_READ, total_len);
 
+  if (read_reqs.empty()) {
+    if (bytes_read) {
+      *bytes_read = 0;
+    }
+    return;
+  }
+
   Buffer buf;
-  AlignedBuf aligned_buf;
+  AlignedBuffer direct_io_buffer;
 
   Status s;
   bool direct_io = file_reader_->use_direct_io();
@@ -478,8 +503,9 @@ void BlobFileReader::MultiGetBlob(
   IODebugContext dbg;
   s = file_reader_->PrepareIOOptions(read_options, opts, &dbg);
   if (s.ok()) {
+    AlignedBufferAllocationContext direct_io_context{&direct_io_buffer};
     s = file_reader_->MultiRead(opts, read_reqs.data(), read_reqs.size(),
-                                direct_io ? &aligned_buf : nullptr, &dbg);
+                                &direct_io_context, &dbg);
   }
   if (!s.ok()) {
     for (auto& req : read_reqs) {
