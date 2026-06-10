@@ -784,6 +784,13 @@ bool FlushJob::MemPurgeDecider(double threshold) {
       // Paranoia: zero out these values just in case.
       max_covering_tombstone_seq = 0;
       sqno = 0;
+      // Get() carries state across calls through these out-parameters: a
+      // NotFound status from a previously sampled deletion entry or
+      // accumulated merge operands would otherwise leak into the next
+      // lookup. SaveValue() asserts a clean status on entry, and stale
+      // operands distort the garbage estimation.
+      mget_s = Status();
+      merge_context.Clear();
 
       // Pick the oldest existing snapshot that is more recent
       // than the sequence number of the sampled entry.
@@ -839,6 +846,10 @@ bool FlushJob::MemPurgeDecider(double threshold) {
         not_in_next_mems = true;
         for (auto next_mem_iter = mem_iter + 1;
              next_mem_iter != std::end(mems_); next_mem_iter++) {
+          // The deletion case above reaches here with mget_s == NotFound;
+          // reset before probing the next memtable.
+          mget_s = Status();
+          merge_context.Clear();
           if ((*next_mem_iter)
                   ->Get(lkey, &vget, /*columns=*/nullptr, /*timestamp=*/nullptr,
                         &mget_s, &merge_context, &max_covering_tombstone_seq,
