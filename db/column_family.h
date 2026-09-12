@@ -29,6 +29,7 @@
 #include "trace_replay/block_cache_tracer.h"
 #include "util/cast_util.h"
 #include "util/hash_containers.h"
+#include "util/mutexlock.h"
 #include "util/thread_local.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -444,8 +445,8 @@ class ColumnFamilyData {
   // Check if the passed range overlap with any running compactions.
   // REQUIRES: DB mutex held
   bool RangeOverlapWithCompaction(const Slice& smallest_user_key,
-                                  const Slice& largest_user_key,
-                                  int level) const;
+                                  const Slice& largest_user_key, int level,
+                                  bool range_limit_exclusive) const;
 
   // Check if the passed ranges overlap with any unflushed memtables
   // (immutable or mutable).
@@ -456,7 +457,8 @@ class ColumnFamilyData {
   // Thread-safe
   Status RangesOverlapWithMemtables(const autovector<UserKeyRange>& ranges,
                                     SuperVersion* super_version,
-                                    bool allow_data_in_errors, bool* overlap);
+                                    bool allow_data_in_errors, bool* overlap,
+                                    bool range_limit_exclusive);
 
   // A flag to tell a manual compaction is to compact all levels together
   // instead of a specific level.
@@ -519,6 +521,32 @@ class ColumnFamilyData {
   void set_queued_for_compaction(bool value) { queued_for_compaction_ = value; }
   bool queued_for_flush() { return queued_for_flush_; }
   bool queued_for_compaction() { return queued_for_compaction_; }
+
+  int compaction_aborted() const {
+    return compaction_aborted_.obj_.load(std::memory_order_acquire);
+  }
+  void inc_compaction_aborted(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    compaction_aborted_.obj_.fetch_add(1, std::memory_order_release);
+  }
+  int dec_compaction_aborted(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    return compaction_aborted_.obj_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  }
+
+  int num_in_flight_compactions(InstrumentedMutex* db_mutex) const {
+    db_mutex->AssertHeld();
+    return num_in_flight_compactions_;
+  }
+  void inc_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    ++num_in_flight_compactions_;
+  }
+  void dec_num_in_flight_compactions(InstrumentedMutex* db_mutex) {
+    db_mutex->AssertHeld();
+    assert(num_in_flight_compactions_ > 0);
+    --num_in_flight_compactions_;
+  }
 
   static std::pair<WriteStallCondition, WriteStallCause>
   GetWriteStallConditionAndCause(
@@ -711,9 +739,25 @@ class ColumnFamilyData {
   // If true --> this ColumnFamily is currently present in DBImpl::flush_queue_
   bool queued_for_flush_;
 
-  // If true --> this ColumnFamily is currently present in
-  // DBImpl::compaction_queue_
+  // If true, this ColumnFamily is in DBImpl::compaction_queue_ or its parked
+  // compaction set.
   bool queued_for_compaction_;
+
+  // Read outside the DB mutex by compaction workers (acquire-loaded roughly
+  // every 1024 records in ProcessKeyValueCompaction). Given its own cache line
+  // via CacheAlignedWrapper to avoid false sharing with the DB-mutex-written
+  // fields packed around it.
+  CacheAlignedWrapper<std::atomic<int>> compaction_aborted_{};
+
+  // Per-CF count of compactions "in flight" for AbortCompactions(): a picked
+  // Compaction (or one CompactFiles call), tracked from
+  // BeginInFlightCompaction() until EndInFlightCompaction() at the end of
+  // BackgroundCompaction, so it covers the NotifyOnCompactionCompleted window
+  // that CompactionPicker's compactions_in_progress_ set does not. NOT the same
+  // as DBImpl::num_running_compactions_ (which counts BackgroundCallCompaction
+  // worker invocations, backs the public rocksdb.num-running-compactions
+  // property, and excludes CompactFiles). Protected by the DB mutex.
+  int num_in_flight_compactions_{0};
 
   uint64_t prev_compaction_needed_bytes_;
 

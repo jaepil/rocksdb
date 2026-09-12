@@ -37,6 +37,10 @@
 #include "rocksdb/table.h"
 #include "rocksdb/thread_status.h"
 
+namespace folly {
+class IOExecutor;
+}
+
 namespace ROCKSDB_NAMESPACE {
 
 class FileLock;
@@ -454,6 +458,19 @@ class FileSystem : public Customizable {
   virtual Status UnregisterDbPaths(const std::vector<std::string>& /*paths*/) {
     return Status::OK();
   }
+
+  // EXPERIMENTAL
+  //
+  // Used in the RocksDB coroutine query interface. Coroutine-based read
+  // requests will run on an EventBase from this executor. Returns nullptr when
+  // coroutine read execution is not supported. When called from one of its
+  // EventBases, the executor's getEventBase() must return that EventBase.
+  virtual folly::IOExecutor* GetReadExecutor() { return nullptr; }
+
+  // Increase the maximum number of threads used by the FileSystem-owned read
+  // IO executor to at least the requested number. The executor is not reduced
+  // when its current maximum is larger. The number must be positive.
+  virtual void SetReadIOExecutorThreads(int /*number*/) {}
 
   // Create a brand new sequentially-readable file with the specified name.
   // On success, stores a pointer to the new file in *result and returns OK.
@@ -1114,6 +1131,28 @@ class FSRandomAccessFile {
   }
 
   // EXPERIMENTAL
+  // Submit a read for RocksDB coroutine queries. The implementation owns the
+  // completion executor and must update req.status and invoke cb(req) exactly
+  // once.
+  //
+  // Returns true when the asynchronous path is used and false when the request
+  // is completed using the synchronous Read fallback.
+  //
+  // All arguments and any memory they reference remain valid until cb is
+  // invoked.
+  //
+  // Default implementation is to read the data synchronously and invoke the
+  // callback before returning.
+  virtual bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
+                               std::function<void(FSReadRequest&)> cb,
+                               IODebugContext* dbg) {
+    req.status =
+        Read(req.offset, req.len, opts, &(req.result), req.scratch, dbg);
+    cb(req);
+    return false;
+  }
+
+  // EXPERIMENTAL
   // When available, returns the actual temperature for the file. This is
   // useful in case some outside process moves a file from one tier to another,
   // though the temperature is generally expected not to change while a file is
@@ -1582,6 +1621,14 @@ class FileSystemWrapper : public FileSystem {
   // Return the target to which this Env forwards all calls
   FileSystem* target() const { return target_.get(); }
 
+  folly::IOExecutor* GetReadExecutor() override {
+    return target_->GetReadExecutor();
+  }
+
+  void SetReadIOExecutorThreads(int num) override {
+    target_->SetReadIOExecutorThreads(num);
+  }
+
   // The following text is boilerplate that forwards all methods to target()
   IOStatus NewSequentialFile(const std::string& f, const FileOptions& file_opts,
                              std::unique_ptr<FSSequentialFile>* r,
@@ -1880,6 +1927,11 @@ class FSRandomAccessFileWrapper : public FSRandomAccessFile {
                      void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
                      IODebugContext* dbg) override {
     return target()->ReadAsync(req, opts, cb, cb_arg, io_handle, del_fn, dbg);
+  }
+  bool SubmitReadAsync(FSReadRequest& req, const IOOptions& opts,
+                       std::function<void(FSReadRequest&)> cb,
+                       IODebugContext* dbg) override {
+    return target()->SubmitReadAsync(req, opts, std::move(cb), dbg);
   }
   Temperature GetTemperature() const override {
     return target_->GetTemperature();

@@ -10,6 +10,9 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <utility>
+#include <vector>
 
 #include "db/arena_wrapped_db_iter.h"
 #include "db/db_iter.h"
@@ -85,6 +88,392 @@ TEST_F(DBIteratorBaseTest, APICallsWithPerfContext) {
   ASSERT_EQ(1, get_perf_context()->iter_prev_count);
 
   delete iter;
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingFiles) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(1, table_iterators_created);
+  ASSERT_EQ(1, files_added);
+  ASSERT_EQ(1, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingLevels) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  ASSERT_OK(Put("m", "vm"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("n"));
+  Slice upper_bound("n");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(2, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(1, level_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a", "m"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanAllowsSingleUnboundedRange) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Put("c", "vc"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("b"));
+  ReadOptions read_options;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  iter->Prepare(scan_opts);
+  std::vector<std::string> keys;
+  for (iter->Seek("b"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"b", "c"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanRejectsRepeatedPrepare) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  iter->Prepare(scan_opts);
+  ASSERT_OK(iter->status());
+  iter->Prepare(scan_opts);
+  ASSERT_NOK(iter->status());
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanDedupsMultipleRangesInSameFile) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("m", "vm"));
+  ASSERT_OK(Put("z", "vz"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  scan_opts.insert(Slice("m"), Slice("n"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(1, table_iterators_created);
+  ASSERT_EQ(1, files_added);
+  ASSERT_EQ(1, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(keys, std::vector<std::string>({"a"}));
+
+  upper_bound = "n";
+  for (iter->Seek("m"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a", "m"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesOverlappingL0Files) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("m", "vm"));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("n"));
+  Slice upper_bound("n");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(2, table_iterators_created);
+  ASSERT_EQ(2, files_added);
+  ASSERT_EQ(2, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a", "m"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+}
+
+TEST_F(DBIteratorBaseTest, PrepareWithMultiScanPrunesNonIntersectingMemTables) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  ASSERT_OK(db_->PauseBackgroundWork());
+  ASSERT_OK(Put("z_imm", "vz"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put("z_mem", "vz"));
+
+  int table_iterators_created = 0;
+  int files_added = 0;
+  int block_based_iterators = 0;
+  int level_iterators = 0;
+  int merging_iterators = 0;
+  SyncPoint::GetInstance()->SetCallBack(
+      "TableCache::NewIterator::BeforeFindTable",
+      [&](void* /*arg*/) { ++table_iterators_created; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:AddedFile",
+      [&](void* /*arg*/) { ++files_added; });
+  SyncPoint::GetInstance()->SetCallBack(
+      "Version::AddIteratorsForLevel:IteratorType", [&](void* arg) {
+        auto* iterator_type = static_cast<std::pair<bool, bool>*>(arg);
+        if (iterator_type->first) {
+          ++block_based_iterators;
+        }
+        if (iterator_type->second) {
+          ++level_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "MergeIteratorBuilder::Finish:UseMergingIterator", [&](void* arg) {
+        if (*static_cast<bool*>(arg)) {
+          ++merging_iterators;
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  MultiScanArgs scan_opts(BytewiseComparator());
+  scan_opts.insert(Slice("a"), Slice("b"));
+  Slice upper_bound("b");
+  ReadOptions read_options;
+  read_options.iterate_upper_bound = &upper_bound;
+  std::unique_ptr<Iterator> iter(
+      db_->NewIterator(read_options, db_->DefaultColumnFamily()));
+
+  ASSERT_EQ(0, table_iterators_created);
+  ASSERT_EQ(0, files_added);
+  ASSERT_EQ(0, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  ASSERT_EQ(0, merging_iterators);
+  iter->Prepare(scan_opts);
+  ASSERT_EQ(1, table_iterators_created);
+  ASSERT_EQ(1, files_added);
+  ASSERT_EQ(1, block_based_iterators);
+  ASSERT_EQ(0, level_iterators);
+  ASSERT_EQ(0, merging_iterators);
+  std::vector<std::string> keys;
+  for (iter->Seek("a"); iter->Valid(); iter->Next()) {
+    keys.push_back(iter->key().ToString());
+  }
+  ASSERT_EQ(keys, std::vector<std::string>({"a"}));
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_OK(db_->ContinueBackgroundWork());
 }
 
 // Test param:
@@ -945,6 +1334,68 @@ TEST_P(DBIteratorTest, IteratorDeleteAfterCfDelete) {
   delete iter;
 }
 
+TEST_P(DBIteratorTest, IteratorSeekAfterCfDelete) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  ASSERT_OK(Put(1, "foo", "delete-cf-then-seek-iter"));
+  ASSERT_OK(Put(1, "hello", "value2"));
+
+  ColumnFamilyHandle* cf = handles_[1];
+  ReadOptions ro;
+
+  auto* iter = db_->NewIterator(ro, cf);
+
+  // Delete the CF handle before the lazy iterator tree is materialized.
+  EXPECT_OK(db_->DestroyColumnFamilyHandle(cf));
+  handles_.erase(std::begin(handles_) + 1);
+
+  iter->Seek("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-seek-iter");
+  iter->SeekForPrev("hello");
+  ASSERT_EQ(IterStatus(iter), "hello->value2");
+  iter->SeekToFirst();
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-seek-iter");
+  iter->Next();
+  ASSERT_EQ(IterStatus(iter), "hello->value2");
+  delete iter;
+}
+
+TEST_P(DBIteratorTest, IteratorAutoRefreshAfterCfDeleteBeforeLazyInit) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  ASSERT_OK(Put(1, "foo", "delete-cf-then-auto-refresh"));
+  ASSERT_OK(Flush(1));
+
+  ColumnFamilyHandle* cf = handles_[1];
+  const Snapshot* snapshot = db_->GetSnapshot();
+
+  ReadOptions ro;
+  ro.snapshot = snapshot;
+  ro.auto_refresh_iterator_with_snapshot = true;
+
+  auto* iter = db_->NewIterator(ro, cf);
+
+  ASSERT_OK(Put(1, "zzz", "after-snapshot"));
+  ASSERT_OK(Flush(1));
+
+  // Delete the CF handle before the lazy iterator tree is materialized. The
+  // following operations force auto-refresh to acquire a newer SuperVersion.
+  EXPECT_OK(db_->DestroyColumnFamilyHandle(cf));
+  handles_.erase(std::begin(handles_) + 1);
+
+  iter->Seek("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-auto-refresh");
+  ASSERT_OK(iter->status());
+  iter->SeekForPrev("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->delete-cf-then-auto-refresh");
+  ASSERT_OK(iter->status());
+  iter->Next();
+  ASSERT_OK(iter->status());
+
+  delete iter;
+  db_->ReleaseSnapshot(snapshot);
+}
+
 TEST_P(DBIteratorTest, IteratorDeleteAfterCfDrop) {
   CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
 
@@ -963,6 +1414,30 @@ TEST_P(DBIteratorTest, IteratorDeleteAfterCfDrop) {
   handles_.erase(std::begin(handles_) + 1);
 
   // delete Iterator after CF handle is dropped
+  delete iter;
+}
+
+TEST_P(DBIteratorTest, IteratorSeekAfterCfDrop) {
+  CreateAndReopenWithCF({"pikachu"}, CurrentOptions());
+
+  ASSERT_OK(Put(1, "foo", "drop-cf-then-seek-iter"));
+
+  ReadOptions ro;
+  ColumnFamilyHandle* cf = handles_[1];
+
+  auto* iter = db_->NewIterator(ro, cf);
+
+  // Drop and delete the CF before the lazy iterator tree is materialized.
+  EXPECT_OK(db_->DropColumnFamily(cf));
+  EXPECT_OK(db_->DestroyColumnFamilyHandle(cf));
+  handles_.erase(std::begin(handles_) + 1);
+
+  iter->Seek("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->drop-cf-then-seek-iter");
+  iter->SeekForPrev("foo");
+  ASSERT_EQ(IterStatus(iter), "foo->drop-cf-then-seek-iter");
+  iter->SeekToFirst();
+  ASSERT_EQ(IterStatus(iter), "foo->drop-cf-then-seek-iter");
   delete iter;
 }
 
@@ -2697,6 +3172,8 @@ TEST_P(DBIteratorTest, CreationFailure) {
 
   Iterator* iter = NewIterator(ReadOptions());
   ASSERT_FALSE(iter->Valid());
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
   ASSERT_TRUE(iter->status().IsCorruption());
   delete iter;
 }
@@ -2753,16 +3230,18 @@ TEST_P(DBIteratorTest, TableFilter) {
   {
     std::set<uint64_t> unseen{1, 2, 3};
     ReadOptions opts;
-    opts.table_filter = [&](const TableProperties& props) {
-      auto it = unseen.find(props.num_entries);
-      if (it == unseen.end()) {
-        ADD_FAILURE() << "saw table properties with an unexpected "
-                      << props.num_entries << " entries";
-      } else {
-        unseen.erase(it);
-      }
-      return true;
-    };
+    std::function<bool(const TableProperties&)> filter =
+        [&](const TableProperties& props) {
+          auto it = unseen.find(props.num_entries);
+          if (it == unseen.end()) {
+            ADD_FAILURE() << "saw table properties with an unexpected "
+                          << props.num_entries << " entries";
+          } else {
+            unseen.erase(it);
+          }
+          return true;
+        };
+    opts.table_filter = &filter;
     auto iter = NewIterator(opts);
     iter->SeekToFirst();
     ASSERT_EQ(IterStatus(iter), "a->1");
@@ -2787,9 +3266,9 @@ TEST_P(DBIteratorTest, TableFilter) {
   // during iteration.
   {
     ReadOptions opts;
-    opts.table_filter = [](const TableProperties& props) {
-      return props.num_entries != 2;
-    };
+    std::function<bool(const TableProperties&)> filter =
+        [](const TableProperties& props) { return props.num_entries != 2; };
+    opts.table_filter = &filter;
     auto iter = NewIterator(opts);
     iter->SeekToFirst();
     ASSERT_EQ(IterStatus(iter), "a->1");
@@ -4941,6 +5420,157 @@ TEST_P(DBMultiScanIteratorTest, AsyncPrefetchAcrossMultipleFiles) {
   iter.reset();
 }
 
+TEST_P(DBMultiScanIteratorTest, ReversePrefetchAcrossMultipleRanges) {
+  auto options = CurrentOptions();
+  options.target_file_size_base = 1 << 15;  // 32KiB
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = 50;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  Random rnd(303);
+  for (int i = 0; i < 1000; ++i) {
+    ASSERT_OK(Put(Key(i), rnd.RandomString(1 << 10)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+  ASSERT_GT(NumTableFilesAtLevel(49), 3);
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  auto tracking_dispatcher = std::make_shared<TrackingIODispatcher>();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.use_async_io = false;
+  scan_options.reverse = true;
+  scan_options.io_dispatcher = tracking_dispatcher;
+  std::vector<std::string> key_ranges(
+      {Key(100), Key(200), Key(500), Key(600), Key(800), Key(900)});
+  scan_options.insert(key_ranges[0], key_ranges[1]);
+  scan_options.insert(key_ranges[2], key_ranges[3]);
+  scan_options.insert(key_ranges[4], key_ranges[5]);
+
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+  ASSERT_NE(iter, nullptr);
+
+  std::vector<std::string> actual_keys;
+  try {
+    for (auto range : *iter) {
+      for (auto it : range) {
+        actual_keys.push_back(it.first.ToString());
+      }
+    }
+  } catch (MultiScanException& ex) {
+    FAIL() << "Iterator returned status " << ex.what();
+  } catch (std::logic_error& ex) {
+    FAIL() << "Iterator returned logic error " << ex.what();
+  }
+
+  std::vector<std::string> expected_keys;
+  for (int i = 199; i >= 100; --i) {
+    expected_keys.push_back(Key(i));
+  }
+  for (int i = 599; i >= 500; --i) {
+    expected_keys.push_back(Key(i));
+  }
+  for (int i = 899; i >= 800; --i) {
+    expected_keys.push_back(Key(i));
+  }
+  ASSERT_EQ(actual_keys, expected_keys);
+  ASSERT_GT(tracking_dispatcher->GetReadSets().size(), 0);
+}
+
+TEST_P(DBMultiScanIteratorTest, ReverseUnreleasedPrefetchBlocksCountAsWasted) {
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  table_options.block_cache = NewLRUCache(10 * 1024 * 1024);
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  constexpr int kNumKeys = 40;
+  const std::string value(100, 'v');
+  for (int i = 0; i < kNumKeys; ++i) {
+    ASSERT_OK(Put(Key(i), value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+  auto tracking_dispatcher = std::make_shared<TrackingIODispatcher>();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.use_async_io = false;
+  scan_options.reverse = true;
+  scan_options.io_dispatcher = tracking_dispatcher;
+  const std::string start_key = Key(0);
+  const std::string limit_key = Key(kNumKeys);
+  scan_options.insert(start_key, limit_key);
+
+  {
+    std::unique_ptr<MultiScan> iter =
+        dbfull()->NewMultiScan(ro, cfh, scan_options);
+    ASSERT_NE(iter, nullptr);
+
+    try {
+      auto range_it = iter->begin();
+      ASSERT_NE(range_it, iter->end());
+      auto range = *range_it;
+      auto row_it = range.begin();
+      ASSERT_NE(row_it, range.end());
+      ASSERT_EQ((*row_it).first.ToString(), Key(kNumKeys - 1));
+    } catch (MultiScanException& ex) {
+      FAIL() << "Iterator returned status " << ex.what();
+    } catch (std::logic_error& ex) {
+      FAIL() << "Iterator returned logic error " << ex.what();
+    }
+
+    ASSERT_GT(tracking_dispatcher->GetReadSets().size(), 0);
+  }
+
+  ASSERT_GT(
+      options.statistics->getTickerCount(MULTISCAN_PREFETCH_BLOCKS_WASTED), 0);
+}
+
+TEST_P(DBMultiScanIteratorTest, ReverseRequiresLimits) {
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("a", "va"));
+  ASSERT_OK(Put("b", "vb"));
+  ASSERT_OK(Flush());
+
+  ReadOptions ro;
+  ro.fill_cache = GetParam();
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+
+  MultiScanArgs scan_options(BytewiseComparator());
+  scan_options.reverse = true;
+  scan_options.insert("a");
+  scan_options.insert("b", "c");
+
+  std::unique_ptr<MultiScan> iter =
+      dbfull()->NewMultiScan(ro, cfh, scan_options);
+  ASSERT_NE(iter, nullptr);
+  try {
+    (void)iter->begin();
+    FAIL() << "Expected reverse MultiScan without an upper bound to fail";
+  } catch (MultiScanException& ex) {
+    ASSERT_NOK(ex.status());
+    ASSERT_TRUE(ex.status().IsInvalidArgument());
+  }
+}
+
 // Wrapper filesystem that does not support async IO.
 // Used to verify that MultiScan gracefully falls back to sync IO.
 class NoAsyncIOFS : public FileSystemWrapper {
@@ -5637,13 +6267,96 @@ TEST_P(DBMultiScanIteratorTest, WastedBlocksTracking) {
   uint64_t wasted =
       options.statistics->getTickerCount(MULTISCAN_PREFETCH_BLOCKS_WASTED);
 
-  // We expect some wasted blocks due to the gap between ranges
-  // The exact number depends on prefetch behavior, but should be > 0
-  // if blocks between k020-k050 were prefetched
-  std::cout << "Wasted blocks: " << wasted << std::endl;
+  ASSERT_GT(wasted, 0);
+}
 
-  // Note: The test verifies the tracking mechanism works.
-  // The actual count depends on prefetch heuristics which may vary.
+TEST_P(DBMultiScanIteratorTest, PrefetchStatsRecorded) {
+  // Regression test: the MultiScan prefetch stats must still be published after
+  // the prefetch path moved into the IODispatcher. A cold scan populates the
+  // prefetch counters; a warm re-scan registers cache hits.
+  auto options = CurrentOptions();
+  options.compression = kNoCompression;
+  options.disable_auto_compactions = true;
+  options.statistics = CreateDBStatistics();
+
+  BlockBasedTableOptions table_options;
+  table_options.flush_block_policy_factory =
+      std::make_shared<FlushBlockEveryKeyPolicyFactory>();
+  table_options.block_cache = NewLRUCache(10 * 1024 * 1024);  // 10MB cache
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  const int kNumKeys = 50;
+  std::string value(100, 'v');
+  for (int i = 0; i < kNumKeys; ++i) {
+    std::stringstream ss;
+    ss << "k" << std::setw(3) << std::setfill('0') << i;
+    ASSERT_OK(Put(ss.str(), value));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(db_->CompactRange({}, nullptr, nullptr));
+
+  ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
+
+  auto run_scan = [&]() {
+    MultiScanArgs scan_options(BytewiseComparator());
+    scan_options.use_async_io = false;  // deterministic sync path
+    scan_options.insert("k000", "k049");
+    ReadOptions ro;
+    ro.fill_cache = true;
+    std::unique_ptr<MultiScan> iter =
+        dbfull()->NewMultiScan(ro, cfh, scan_options);
+    ASSERT_NE(iter, nullptr);
+    if (iter == nullptr) {
+      return;
+    }
+    int count = 0;
+    try {
+      for (auto range : *iter) {
+        for (auto it : range) {
+          it.first.ToString();
+          count++;
+        }
+      }
+    } catch (MultiScanException& ex) {
+      FAIL() << "Scan failed: " << ex.what();
+    }
+    ASSERT_GT(count, 0);
+  };
+
+  // Cold scan: force blocks to be read from disk so the prefetch path runs.
+  table_options.block_cache->EraseUnRefEntries();
+  SetPerfLevel(kEnableCount);
+  PerfContext* perf = get_perf_context();
+  ASSERT_NE(perf, nullptr);
+  if (perf == nullptr) {
+    return;
+  }
+  perf->Reset();
+  run_scan();  // MultiScanIndexIterator destroyed here -> stats recorded
+
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_PREPARE_CALLS), 0);
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_BLOCKS_PREFETCHED), 0);
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_PREFETCH_BYTES), 0);
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_IO_REQUESTS), 0);
+  HistogramData blocks_per_prepare;
+  options.statistics->histogramData(MULTISCAN_BLOCKS_PER_PREPARE,
+                                    &blocks_per_prepare);
+  ASSERT_GT(blocks_per_prepare.count, 0);
+
+  // PerfContext mirrors the same metrics scoped to this operation/thread.
+  ASSERT_GT(perf->multiscan_prepare_count, 0);
+  ASSERT_GT(perf->multiscan_blocks_prefetched, 0);
+  ASSERT_GT(perf->multiscan_prefetch_bytes, 0);
+  ASSERT_GT(perf->multiscan_io_requests, 0);
+  SetPerfLevel(kDisable);
+
+  // Warm scan: the just-cached blocks now count as cache hits.
+  uint64_t cache_hits_before =
+      TestGetTickerCount(options, MULTISCAN_BLOCKS_FROM_CACHE);
+  run_scan();
+  ASSERT_GT(TestGetTickerCount(options, MULTISCAN_BLOCKS_FROM_CACHE),
+            cache_hits_before);
 }
 
 class ReadPathRangeTombstoneTest : public DBIteratorBaseTest,
@@ -6440,9 +7153,9 @@ TEST_P(ReadPathRangeTombstoneTest, TableFilterNotAllowed) {
 
   {
     ReadOptions filtered_ro;
-    filtered_ro.table_filter = [](const TableProperties& props) {
-      return props.num_entries != 2;
-    };
+    std::function<bool(const TableProperties&)> filter =
+        [](const TableProperties& props) { return props.num_entries != 2; };
+    filtered_ro.table_filter = &filter;
     // Hiding the two-delete SST would otherwise leave this iterator with a
     // partial SST view plus the previously converted memtable tombstone,
     // allowing hidden SST state to affect the filtered read result.

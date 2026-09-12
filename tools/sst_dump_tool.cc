@@ -108,6 +108,10 @@ void print_help(bool to_stderr) {
       Used with --command=recompress to specify whether to compress index
       blocks (in addition to data blocks).
 
+    --verify_compression=<bool>
+      Used with --command=recompress to specify whether to verify that
+      decompressing the compressed block gives back the input.
+
     --parse_internal_key=<0xKEY>
       Convenience option to parse an internal key on the command line. Dumps the
       internal key in hex format {'key' @ SN: type}
@@ -131,6 +135,28 @@ void print_help(bool to_stderr) {
 
     --compression_parallel_threads=<uint32_t>
       Number of parallel threads to use with --command=recompress
+      NOTE: known *fast* compression configurations can quietly override this setting
+      to non-parallel, for efficiency
+
+    --compression_max_compressed_bytes_per_kb=<int>
+      Used with --command=recompress to set the per-block minimum compression
+      worth keeping, as stored bytes per KB of input (smaller demands more
+      savings). Also serves as the bar for --compression_auto_skip.
+
+    --compression_auto_skip=<bool>
+      Used with --command=recompress to enable AutoSkip compression: stop
+      attempting compression on data blocks once it is not paying off (reuses
+      max_compressed_bytes_per_kb as the bar).
+      NOTE: recompress resets the AutoSkip estimator between each compression
+      type/level measured, so each is measured independently. This differs from
+      normal operation, where the estimate carries across the files a flush or
+      compaction thread emits.
+
+    --compression_auto_skip_min_sample_every=<int>
+      Used with --command=recompress to set the AutoSkip nominal sampling
+      interval (skipped data blocks between forced compression samples). 0
+      selects an internal default. Only meaningful with
+      --compression_auto_skip=1.
 
     --compression_use_zstd_finalize_dict
       Use zstd's finalizeDictionary() API instead of zstd's dictionary trainer to generate dictionary.
@@ -206,6 +232,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   std::shared_ptr<CompressionManager> compression_manager;
   bool enable_index_compression =
       BlockBasedTableOptions{}.enable_index_compression;
+  bool verify_compression = BlockBasedTableOptions{}.verify_compression;
   uint64_t total_num_files = 0;
   uint64_t total_num_data_blocks = 0;
   uint64_t total_data_block_size = 0;
@@ -222,6 +249,12 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   bool compression_use_zstd_finalize_dict =
       !ROCKSDB_NAMESPACE::CompressionOptions().use_zstd_dict_trainer;
   uint32_t compression_parallel_threads = 1;
+  bool compression_auto_skip =
+      ROCKSDB_NAMESPACE::CompressionOptions().auto_skip;
+  int32_t compression_auto_skip_min_sample_every =
+      ROCKSDB_NAMESPACE::CompressionOptions().auto_skip_min_sample_every;
+  int compression_max_compressed_bytes_per_kb =
+      ROCKSDB_NAMESPACE::CompressionOptions().max_compressed_bytes_per_kb;
 
   int64_t tmp_val;
 
@@ -316,6 +349,11 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         enable_index_compression =
             argv[i][27] == '1' || argv[i][27] == 't' || argv[i][27] == 'T';
       }
+    } else if (strncmp(argv[i], "--verify_compression=", 21) == 0) {
+      if (strlen(argv[i]) > 21) {
+        verify_compression =
+            argv[i][21] == '1' || argv[i][21] == 't' || argv[i][21] == 'T';
+      }
     } else if (strncmp(argv[i], "--parse_internal_key=", 21) == 0) {
       std::string in_key(argv[i] + 21);
       try {
@@ -394,6 +432,37 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         return 1;
       }
       compression_max_dict_buffer_bytes = static_cast<uint64_t>(tmp_val);
+    } else if (strncmp(argv[i], "--compression_auto_skip=", 24) == 0) {
+      if (strlen(argv[i]) > 24) {
+        compression_auto_skip =
+            argv[i][24] == '1' || argv[i][24] == 't' || argv[i][24] == 'T';
+      }
+    } else if (ParseIntArg(
+                   argv[i], "--compression_auto_skip_min_sample_every=",
+                   "compression_auto_skip_min_sample_every must be numeric",
+                   &tmp_val)) {
+      if (tmp_val < 0 || tmp_val > std::numeric_limits<int32_t>::max()) {
+        fprintf(stderr,
+                "compression_auto_skip_min_sample_every out of range: '%s'\n",
+                argv[i]);
+        print_help(/*to_stderr*/ true);
+        return 1;
+      }
+      compression_auto_skip_min_sample_every = static_cast<int32_t>(tmp_val);
+    } else if (ParseIntArg(
+                   argv[i], "--compression_max_compressed_bytes_per_kb=",
+                   "compression_max_compressed_bytes_per_kb must be numeric",
+                   &tmp_val)) {
+      if (tmp_val < 0 || tmp_val > 1024) {
+        fprintf(
+            stderr,
+            "compression_max_compressed_bytes_per_kb out of range (0-1024): "
+            "'%s'\n",
+            argv[i]);
+        print_help(/*to_stderr*/ true);
+        return 1;
+      }
+      compression_max_compressed_bytes_per_kb = static_cast<int>(tmp_val);
     } else if (strcmp(argv[i], "--compression_use_zstd_finalize_dict") == 0) {
       compression_use_zstd_finalize_dict = true;
     } else if (strcmp(argv[i], "--list_meta_blocks") == 0) {
@@ -522,6 +591,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
       }
       bbto.block_size = block_size;
       bbto.enable_index_compression = enable_index_compression;
+      bbto.verify_compression = verify_compression;
       // Maximize compression features available
       bbto.format_version = kLatestBbtFormatVersion;
       options.table_factory = std::make_shared<BlockBasedTableFactory>(bbto);
@@ -534,6 +604,11 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
     options.compression_opts.use_zstd_dict_trainer =
         !compression_use_zstd_finalize_dict;
     options.compression_opts.parallel_threads = compression_parallel_threads;
+    options.compression_opts.auto_skip = compression_auto_skip;
+    options.compression_opts.auto_skip_min_sample_every =
+        compression_auto_skip_min_sample_every;
+    options.compression_opts.max_compressed_bytes_per_kb =
+        compression_max_compressed_bytes_per_kb;
 
     ROCKSDB_NAMESPACE::SstFileDumper dumper(
         options, filename, Temperature::kUnknown, readahead_size,

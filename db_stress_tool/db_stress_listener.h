@@ -13,7 +13,6 @@
 
 #include "db_stress_tool/db_stress_compaction_service.h"
 #include "db_stress_tool/db_stress_shared_state.h"
-#include "file/filename.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -231,6 +230,10 @@ class DbStressListener : public EventListener {
       precommitted_jobs_.erase(it);
     }
 
+    if (ci.status.ok() && !ci.aborted) {
+      shared_->IncSuccessfulCompactions();
+    }
+
     // pretending doing some work here
     RandomSleep();
   }
@@ -417,7 +420,7 @@ class DbStressListener : public EventListener {
         }
       }
     }
-    // We can't do exact matching since remote workers use dynamic temp paths
+    // We can't do exact matching since remote workers use dynamic temp paths.
     if (file_dir.find(DbStressCompactionService::kTempOutputDirectoryPrefix) !=
         std::string::npos) {
       return;

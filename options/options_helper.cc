@@ -84,6 +84,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.max_open_files = mutable_db_options.max_open_files;
   options.max_file_opening_threads =
       immutable_db_options.max_file_opening_threads;
+  options.read_io_executor_threads =
+      immutable_db_options.read_io_executor_threads;
   options.max_total_wal_size = mutable_db_options.max_total_wal_size;
   options.statistics = immutable_db_options.statistics;
   options.use_fsync = immutable_db_options.use_fsync;
@@ -201,6 +203,10 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
   options.daily_offpeak_time_utc = mutable_db_options.daily_offpeak_time_utc;
   options.max_compaction_trigger_wakeup_seconds =
       mutable_db_options.max_compaction_trigger_wakeup_seconds;
+  options.remote_compaction_manifest_floor =
+      mutable_db_options.remote_compaction_manifest_floor;
+  options.periodic_compaction_phase_recovery_percent =
+      mutable_db_options.periodic_compaction_phase_recovery_percent;
   options.follower_refresh_catchup_period_ms =
       immutable_db_options.follower_refresh_catchup_period_ms;
   options.follower_catchup_retry_count =
@@ -211,6 +217,8 @@ void BuildDBOptions(const ImmutableDBOptions& immutable_db_options,
       immutable_db_options.metadata_write_temperature;
   options.wal_write_temperature = immutable_db_options.wal_write_temperature;
   options.compaction_service = immutable_db_options.compaction_service;
+  options.use_session_tmp_dir_for_remote_compaction =
+      immutable_db_options.use_session_tmp_dir_for_remote_compaction;
   options.calculate_sst_write_lifetime_hint_set =
       immutable_db_options.calculate_sst_write_lifetime_hint_set;
 }
@@ -294,6 +302,8 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->enable_blob_files = moptions.enable_blob_files;
   cf_opts->min_blob_size = moptions.min_blob_size;
   cf_opts->blob_file_size = moptions.blob_file_size;
+  cf_opts->blob_file_writable_file_max_buffer_size =
+      moptions.blob_file_writable_file_max_buffer_size;
   cf_opts->blob_compression_type = moptions.blob_compression_type;
   cf_opts->blob_compression_opts = moptions.blob_compression_opts;
   cf_opts->enable_blob_garbage_collection =

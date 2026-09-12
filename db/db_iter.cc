@@ -26,6 +26,7 @@
 #include "logging/logging.h"
 #include "memory/arena.h"
 #include "monitoring/perf_context_imp.h"
+#include "options/options_helper.h"
 #include "port/likely.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_dispatcher.h"
@@ -67,8 +68,9 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
                const MutableCFOptions& mutable_cf_options,
                const Comparator* cmp, InternalIterator* iter,
                const Version* version, SequenceNumber s, bool arena_mode,
-               ReadCallback* read_callback, ColumnFamilyHandleImpl* cfh,
-               bool expose_blob_index, ReadOnlyMemTable* active_mem)
+               ReadCallback* read_callback, DBImpl* db_impl,
+               ColumnFamilyData* cfd, bool expose_blob_index,
+               ReadOnlyMemTable* active_mem)
     : prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
       env_(_env),
       clock_(ioptions.clock),
@@ -76,21 +78,24 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       user_comparator_(cmp),
       merge_operator_(ioptions.merge_operator.get()),
       iter_(iter),
-      blob_state_(
-          version, read_options.read_tier, read_options.verify_checksums,
-          read_options.fill_cache, read_options.io_activity,
-          cfh ? cfh->cfd()->blob_file_cache() : nullptr,
-          cfh != nullptr && cfh->cfd()->blob_partition_manager() != nullptr),
+      // Enable the direct-write blob fallback only when this CF has a
+      // write-path partition manager; otherwise the fetcher stays on the
+      // version-backed path.
+      blob_state_(version, read_options, cfd ? cfd->blob_file_cache() : nullptr,
+                  cfd != nullptr && cfd->blob_partition_manager() != nullptr),
       read_callback_(read_callback),
       sequence_(s),
-      value_columns_state_(version, read_options, cfh),
+      value_columns_state_(version, read_options, cfd),
       statistics_(ioptions.stats),
       max_skip_(mutable_cf_options.max_sequential_skip_in_iterations),
       max_skippable_internal_keys_(read_options.max_skippable_internal_keys),
       num_internal_keys_skipped_(0),
       iterate_lower_bound_(read_options.iterate_lower_bound),
       iterate_upper_bound_(read_options.iterate_upper_bound),
-      cfh_(cfh),
+      trace_db_(db_impl),
+      trace_cf_id_(cfd != nullptr ? cfd->GetID() : 0),
+      has_trace_state_(db_impl != nullptr && cfd != nullptr),
+      ingest_sst_lock_(cfd != nullptr ? &cfd->GetIngestSstLock() : nullptr),
       timestamp_ub_(read_options.timestamp),
       timestamp_lb_(read_options.iter_start_ts),
       timestamp_size_(timestamp_ub_ ? timestamp_ub_->size() : 0),
@@ -118,7 +123,7 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       // prefix_same_as_start do not guarantee complete scans, so conversion
       // must stay disabled for the iterator lifetime.
       min_tombstones_for_range_conversion_(
-          active_mem != nullptr && !read_options.table_filter &&
+          active_mem != nullptr && !HasTableFilter(read_options) &&
                   (expect_total_order_inner_iter_ || prefix_same_as_start_) &&
                   HasFullTimestampVisibility(read_options)
               ? mutable_cf_options.min_tombstones_for_range_conversion
@@ -253,62 +258,25 @@ void DBIter::Next() {
   }
 }
 
-Status DBIter::BlobReader::RetrieveAndSetBlobValue(
-    const Slice& user_key, const Slice& blob_index,
-    bool allow_write_path_fallback) {
+Status DBIter::BlobReader::RetrieveAndSetBlobValue(const Slice& user_key,
+                                                   const Slice& blob_index) {
   assert(blob_value_.empty());
 
-  if (!version_ && (!allow_write_path_fallback || !blob_file_cache_)) {
+  if (!blob_fetcher_.CanResolve()) {
     return Status::Corruption("Encountered unexpected blob index.");
   }
 
-  // TODO: consider moving ReadOptions from ArenaWrappedDBIter to DBIter to
-  // avoid having to copy options back and forth.
   // TODO: plumb Env::IOPriority
-  ReadOptions read_options;
-  read_options.read_tier = read_tier_;
-  read_options.verify_checksums = verify_checksums_;
-  read_options.fill_cache = fill_cache_;
-  read_options.io_activity = io_activity_;
   constexpr FilePrefetchBuffer* prefetch_buffer = nullptr;
   constexpr uint64_t* bytes_read = nullptr;
-
-  if (!allow_write_path_fallback) {
-    assert(version_ != nullptr);
-    return version_->GetBlob(read_options, user_key, blob_index,
-                             prefetch_buffer, &blob_value_, bytes_read);
-  }
-
-  BlobIndex blob_idx;
-  Status s = blob_idx.DecodeFrom(blob_index);
-  if (!s.ok()) {
-    return s;
-  }
-
-  return BlobFilePartitionManager::ResolveBlobDirectWriteIndex(
-      read_options, user_key, blob_idx, version_, blob_file_cache_,
-      prefetch_buffer, &blob_value_, bytes_read);
-}
-
-BlobFetcher DBIter::BlobReader::CreateBlobFetcher() const {
-  ReadOptions read_options;
-  read_options.read_tier = read_tier_;
-  read_options.verify_checksums = verify_checksums_;
-  read_options.fill_cache = fill_cache_;
-  read_options.io_activity = io_activity_;
-  return BlobFetcher(version_, read_options, blob_file_cache_,
-                     allow_write_path_fallback_);
+  return blob_fetcher_.FetchBlob(user_key, blob_index, prefetch_buffer,
+                                 &blob_value_, bytes_read);
 }
 
 bool DBIter::SetValueAndColumnsFromBlobImpl(const Slice& user_key,
                                             const Slice& blob_index) {
-  // Keep the non-BDW iterator path on the pre-existing Version::GetBlob()
-  // fast path. Only enable the direct-write fallback when this CF actually
-  // has a write-path partition manager.
-  const bool allow_write_path_fallback =
-      cfh_ != nullptr && cfh_->cfd()->blob_partition_manager() != nullptr;
-  const Status s = blob_state_.mut()->reader.RetrieveAndSetBlobValue(
-      user_key, blob_index, allow_write_path_fallback);
+  const Status s =
+      blob_state_.mut()->reader.RetrieveAndSetBlobValue(user_key, blob_index);
   if (!s.ok()) {
     status_ = s;
     valid_ = false;
@@ -364,7 +332,8 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   }
   if (LIKELY(!has_blob_columns)) {
     WideColumns& wide_columns = state.wide_columns();
-    const Status s = WideColumnSerialization::Deserialize(slice, wide_columns);
+    const Status s =
+        WideColumnSerialization::DeserializeSimple(slice, wide_columns);
 
     if (!s.ok()) {
       status_ = s;
@@ -386,9 +355,9 @@ bool DBIter::SetValueAndColumnsFromEntity(Slice slice) {
   state.SaveEntitySliceIfNeeded(slice);
 
   {
-    Slice input_copy = state.PrepareForLazyEntityDeserialize();
-    const Status s = WideColumnSerialization::DeserializeV2(
-        input_copy, state.lazy_entity_columns(), state.lazy_blob_columns());
+    const Slice entity = state.PrepareForLazyEntityDeserialize();
+    const Status s = WideColumnSerialization::Deserialize(
+        entity, state.lazy_entity_columns(), &state.lazy_blob_columns());
 
     if (!s.ok()) {
       status_ = s;
@@ -1617,10 +1586,8 @@ bool DBIter::MergeWithBlobBaseValue(const Slice& blob_index,
     return false;
   }
 
-  const bool allow_write_path_fallback =
-      cfh_ != nullptr && cfh_->cfd()->blob_partition_manager() != nullptr;
-  const Status s = blob_state_.mut()->reader.RetrieveAndSetBlobValue(
-      user_key, blob_index, allow_write_path_fallback);
+  const Status s =
+      blob_state_.mut()->reader.RetrieveAndSetBlobValue(user_key, blob_index);
   if (!s.ok()) {
     status_ = s;
     valid_ = false;
@@ -1642,12 +1609,11 @@ bool DBIter::MergeWithWideColumnBaseValue(const Slice& entity,
                                           const Slice& user_key) {
   // Resolve V2 entity blob columns if present, since TimedFullMerge only
   // supports V1 format.
-  BlobFetcher blob_fetcher = blob_state_->reader.CreateBlobFetcher();
   std::string resolved_entity;
   Slice effective_entity;
   Status s_resolve = WideColumnSerialization::ResolveEntityForMerge(
-      entity, user_key, &blob_fetcher, nullptr /* prefetch_buffers */,
-      resolved_entity, effective_entity);
+      entity, user_key, &blob_state_->reader.blob_fetcher(),
+      nullptr /* prefetch_buffers */, resolved_entity, effective_entity);
   if (!s_resolve.ok()) {
     status_ = std::move(s_resolve);
     valid_ = false;
@@ -1816,10 +1782,10 @@ void DBIter::MaybeInsertRangeTombstone(const Slice& end_key) {
     }
   }
 
-  assert(cfh_ != nullptr);
+  assert(ingest_sst_lock_ != nullptr);
   if (active_mem_->AddLogicallyRedundantRangeTombstone(
           insert_seq, range_tomb_first_key_.GetUserKey(), end_key,
-          cfh_->cfd()->GetIngestSstLock())) {
+          *ingest_sst_lock_)) {
     RecordTick(statistics_, READ_PATH_RANGE_TOMBSTONES_INSERTED);
     ROCKS_LOG_DEBUG(logger_,
                     "Inserted range tombstone [%s, %s) @ seq %" PRIu64
@@ -1919,6 +1885,9 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
 
   const std::vector<ScanOptions>& scan_opts = multiscan_opts.GetScanRanges();
   const bool has_limit = scan_opts.front().range.limit.has_value();
+  if (multiscan_opts.reverse && !has_limit) {
+    return Status::InvalidArgument("Reverse MultiScan requires limit");
+  }
   if (!has_limit && scan_opts.size() > 1) {
     return Status::InvalidArgument("Scan has no upper bound");
   }
@@ -1959,10 +1928,10 @@ Status DBIter::ValidateScanOptions(const MultiScanArgs& multiscan_opts) const {
   return Status::OK();
 }
 
-void DBIter::Prepare(const MultiScanArgs& scan_opts) {
+Status DBIter::SetScanOptionsForPrepare(const MultiScanArgs& scan_opts) {
   status_ = ValidateScanOptions(scan_opts);
   if (!status_.ok()) {
-    return;
+    return status_;
   }
   std::optional<MultiScanArgs> new_scan_opts;
   new_scan_opts.emplace(scan_opts);
@@ -1975,11 +1944,24 @@ void DBIter::Prepare(const MultiScanArgs& scan_opts) {
   if (!scan_opts_.value().io_dispatcher) {
     scan_opts_->io_dispatcher.reset(NewIODispatcher());
   }
+  return Status::OK();
+}
 
-  if (!scan_opts.empty()) {
+void DBIter::PrepareInternalChildren() {
+  if (!scan_opts_.has_value() || !status_.ok()) {
+    return;
+  }
+
+  if (scan_opts_.value().HasBoundedScanRanges()) {
     iter_.Prepare(&scan_opts_.value());
   } else {
     iter_.Prepare(nullptr);
+  }
+}
+
+void DBIter::Prepare(const MultiScanArgs& scan_opts) {
+  if (SetScanOptionsForPrepare(scan_opts).ok()) {
+    PrepareInternalChildren();
   }
 }
 
@@ -1989,6 +1971,12 @@ void DBIter::Seek(const Slice& target) {
   StopWatch sw(clock_, statistics_, DB_SEEK);
 
   if (scan_opts_.has_value()) {
+    if (scan_opts_->reverse) {
+      status_ = Status::InvalidArgument("Seek called on reverse MultiScan");
+      valid_ = false;
+      return;
+    }
+
     // Validate the seek target is as expected in the previously prepared range
     auto const& scan_ranges = scan_opts_.value().GetScanRanges();
     if (scan_index_ >= scan_ranges.size()) {
@@ -2029,7 +2017,7 @@ void DBIter::Seek(const Slice& target) {
     scan_index_++;
   }
 
-  if (cfh_ != nullptr) {
+  if (has_trace_state_) {
     // TODO: What do we do if this returns an error?
     Slice lower_bound, upper_bound;
     if (iterate_lower_bound_ != nullptr) {
@@ -2042,9 +2030,7 @@ void DBIter::Seek(const Slice& target) {
     } else {
       upper_bound = Slice("");
     }
-    cfh_->db()
-        ->TraceIteratorSeek(cfh_->cfd()->GetID(), target, lower_bound,
-                            upper_bound)
+    trace_db_->TraceIteratorSeek(trace_cf_id_, target, lower_bound, upper_bound)
         .PermitUncheckedError();
   }
 
@@ -2097,7 +2083,62 @@ void DBIter::SeekForPrev(const Slice& target) {
   PERF_CPU_TIMER_GUARD(iter_seek_cpu_nanos, clock_);
   StopWatch sw(clock_, statistics_, DB_SEEK);
 
-  if (cfh_ != nullptr) {
+  if (scan_opts_.has_value()) {
+    if (!scan_opts_->reverse) {
+      status_ =
+          Status::InvalidArgument("SeekForPrev called on forward MultiScan");
+      valid_ = false;
+      return;
+    }
+
+    auto const& scan_ranges = scan_opts_.value().GetScanRanges();
+    if (scan_index_ >= scan_ranges.size()) {
+      status_ = Status::InvalidArgument(
+          "SeekForPrev called after exhausting all of the scan ranges");
+      valid_ = false;
+      return;
+    }
+
+    auto const& range = scan_ranges[scan_index_];
+    auto const& limit = range.range.limit;
+    assert(limit.has_value());
+    if (!limit.has_value() ||
+        user_comparator_.CompareWithoutTimestamp(target, *limit) != 0) {
+      status_ = Status::InvalidArgument(
+          "SeekForPrev target does not match the limit of the next prepared "
+          "range at index " +
+          std::to_string(scan_index_));
+      valid_ = false;
+      return;
+    }
+
+    auto const& start = range.range.start;
+    assert(start.has_value());
+    if (iterate_lower_bound_ == nullptr ||
+        user_comparator_.CompareWithoutTimestamp(start.value(),
+                                                 *iterate_lower_bound_) != 0) {
+      status_ = Status::InvalidArgument(
+          "Lower bound is not set to the same start value of the next "
+          "prepared range at index " +
+          std::to_string(scan_index_));
+      valid_ = false;
+      return;
+    }
+    if (iterate_upper_bound_ == nullptr ||
+        user_comparator_.CompareWithoutTimestamp(limit.value(),
+                                                 *iterate_upper_bound_) != 0) {
+      status_ = Status::InvalidArgument(
+          "Upper bound is not set to the same limit value of the next "
+          "prepared range at index " +
+          std::to_string(scan_index_));
+      valid_ = false;
+      return;
+    }
+
+    scan_index_++;
+  }
+
+  if (has_trace_state_) {
     // TODO: What do we do if this returns an error?
     Slice lower_bound, upper_bound;
     if (iterate_lower_bound_ != nullptr) {
@@ -2110,8 +2151,8 @@ void DBIter::SeekForPrev(const Slice& target) {
     } else {
       upper_bound = Slice("");
     }
-    cfh_->db()
-        ->TraceIteratorSeekForPrev(cfh_->cfd()->GetID(), target, lower_bound,
+    trace_db_
+        ->TraceIteratorSeekForPrev(trace_cf_id_, target, lower_bound,
                                    upper_bound)
         .PermitUncheckedError();
   }

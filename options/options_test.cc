@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstring>
+#include <type_traits>
 #include <unordered_map>
 
 #include "cache/lru_cache.h"
@@ -44,6 +45,11 @@ DEFINE_bool(enable_print, false, "Print options generated to console.");
 #endif  // GFLAGS
 
 namespace ROCKSDB_NAMESPACE {
+
+// ReadOptions is copied frequently on read paths, so keep it cheap to copy:
+// all members must stay trivially copyable (use pointers, not std::function /
+// std::string / std::shared_ptr members).
+static_assert(std::is_trivially_copyable_v<ReadOptions>);
 
 class OptionsTest : public testing::Test {};
 
@@ -125,6 +131,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"enable_blob_files", "true"},
       {"min_blob_size", "1K"},
       {"blob_file_size", "1G"},
+      {"blob_file_writable_file_max_buffer_size", "128K"},
       {"blob_compression_type", "kZSTD"},
       {"blob_compression_opts", "-14:1:0:0:0:true"},
       {"enable_blob_garbage_collection", "true"},
@@ -285,6 +292,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.enable_blob_files, true);
   ASSERT_EQ(new_cf_opt.min_blob_size, 1ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_file_size, 1ULL << 30);
+  ASSERT_EQ(new_cf_opt.blob_file_writable_file_max_buffer_size, 128ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_compression_type, kZSTD);
   ASSERT_EQ(new_cf_opt.blob_compression_opts.level, 1);
   ASSERT_EQ(new_cf_opt.enable_blob_garbage_collection, true);
@@ -2661,6 +2669,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"enable_blob_files", "true"},
       {"min_blob_size", "1K"},
       {"blob_file_size", "1G"},
+      {"blob_file_writable_file_max_buffer_size", "128K"},
       {"blob_compression_type", "kZSTD"},
       {"blob_compression_opts", "-14:1:0:0:0:true"},
       {"enable_blob_garbage_collection", "true"},
@@ -2819,6 +2828,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.enable_blob_files, true);
   ASSERT_EQ(new_cf_opt.min_blob_size, 1ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_file_size, 1ULL << 30);
+  ASSERT_EQ(new_cf_opt.blob_file_writable_file_max_buffer_size, 128ULL << 10);
   ASSERT_EQ(new_cf_opt.blob_compression_type, kZSTD);
   ASSERT_EQ(new_cf_opt.blob_compression_opts.level, 1);
   ASSERT_EQ(new_cf_opt.enable_blob_garbage_collection, true);

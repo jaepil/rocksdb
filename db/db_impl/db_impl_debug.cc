@@ -35,6 +35,11 @@ Status DBImpl::TEST_SwitchWAL() {
   return s;
 }
 
+Status DBImpl::TEST_ResumeImpl(DBRecoverContext context) {
+  InstrumentedMutexLock l(&mutex_);
+  return ResumeImpl(context, Env::IOActivity::kFlush);
+}
+
 uint64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
     ColumnFamilyHandle* column_family) {
   ColumnFamilyData* cfd;
@@ -159,6 +164,22 @@ Status DBImpl::TEST_FlushMemTable(ColumnFamilyData* cfd,
   return FlushMemTable(cfd, flush_opts, FlushReason::kTest);
 }
 
+Status DBImpl::TEST_FlushMemTableWithListenerWait(bool allow_write_stall,
+                                                  ColumnFamilyHandle* cfh) {
+  FlushOptions fo;
+  fo.wait = true;
+  fo.listener_wait = true;
+  fo.allow_write_stall = allow_write_stall;
+  ColumnFamilyData* cfd;
+  if (cfh == nullptr) {
+    cfd = default_cf_handle_->cfd();
+  } else {
+    auto cfhi = static_cast_with_check<ColumnFamilyHandleImpl>(cfh);
+    cfd = cfhi->cfd();
+  }
+  return FlushMemTable(cfd, fo, FlushReason::kTest);
+}
+
 Status DBImpl::TEST_AtomicFlushMemTables(
     const autovector<ColumnFamilyData*>& provided_candidate_cfds,
     const FlushOptions& flush_opts) {
@@ -202,6 +223,12 @@ Status DBImpl::TEST_WaitForPurge() {
 Status DBImpl::TEST_GetBGError() {
   InstrumentedMutexLock l(&mutex_);
   return error_handler_.GetBGError();
+}
+
+void DBImpl::TEST_SetBGError(const IOStatus& error,
+                             BackgroundErrorReason reason) {
+  InstrumentedMutexLock l(&mutex_);
+  error_handler_.SetBGError(error, reason);
 }
 
 bool DBImpl::TEST_IsRecoveryInProgress() {

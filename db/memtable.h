@@ -858,6 +858,10 @@ class MemTable final : public ReadOnlyMemTable {
   // Returns a heuristic flush decision
   bool ShouldFlushNow();
 
+  // Returns the reason for a flush scheduled because this memtable decided it
+  // should stop accepting more writes.
+  FlushReason GetFlushReason() const;
+
   // Updates `fragmented_range_tombstone_list_` that will be used to serve reads
   // when this memtable becomes an immutable memtable (in some
   // MemtableListVersion::memlist_). Should be called when this memtable is
@@ -997,7 +1001,8 @@ class MemTable final : public ReadOnlyMemTable {
                     std::string* timestamp, Status* s,
                     MergeContext* merge_context, SequenceNumber* seq,
                     bool* found_final_value, bool* merge_in_progress,
-                    const BlobFetcher* blob_fetcher);
+                    const BlobFetcher* blob_fetcher,
+                    bool* newer_version_present = nullptr);
 
   // Always returns non-null and assumes certain pre-checks (e.g.,
   // is_range_del_table_empty_) are done. This is only valid during the lifetime

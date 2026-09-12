@@ -251,8 +251,9 @@ void CompactionIterator::SetBlobFetcher(const Version* version,
   read_options.io_activity = io_activity;
   read_options.fill_cache = false;
 
-  blob_fetcher_ = std::make_unique<BlobFetcher>(
-      version, read_options, blob_file_cache, allow_write_path_fallback);
+  blob_fetcher_ = std::make_unique<OwningVersionBlobFetcher>(
+      version, std::move(read_options), blob_file_cache,
+      allow_write_path_fallback);
   blob_resolver_.Init(blob_fetcher_.get(), prefetch_buffers_.get(),
                       &iter_stats_);
 }
@@ -467,14 +468,14 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
           }
         }
         if (UNLIKELY(has_blob_columns)) {
-          // Entity has blob columns. DeserializeV2() populates
+          // Entity has blob columns. Deserialize() populates
           // entity_columns_ with the full column set; blob-backed entries still
           // carry the serialized BlobIndex bytes in value(). The companion
           // entity_blob_columns_ side list identifies which column indexes are
           // blob references and provides the decoded BlobIndex objects.
           Slice input_copy = value_;
-          Status s = WideColumnSerialization::DeserializeV2(
-              input_copy, entity_columns_, entity_blob_columns_);
+          Status s = WideColumnSerialization::Deserialize(
+              input_copy, entity_columns_, &entity_blob_columns_);
           if (!s.ok()) {
             status_ = s;
             validity_info_.Invalidate();
@@ -541,7 +542,7 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
         } else {
           // No blob columns, use fast path
           Slice value_copy = value_;
-          const Status s = WideColumnSerialization::Deserialize(
+          const Status s = WideColumnSerialization::DeserializeSimple(
               value_copy, filter_existing_columns_);
 
           if (!s.ok()) {
@@ -1550,8 +1551,8 @@ void CompactionIterator::ExtractLargeColumnValuesIfNeeded() {
     Slice entity_slice = value_;
     entity_columns_.clear();
     entity_blob_columns_.clear();
-    Status s = WideColumnSerialization::DeserializeV2(
-        entity_slice, entity_columns_, entity_blob_columns_);
+    Status s = WideColumnSerialization::Deserialize(
+        entity_slice, entity_columns_, &entity_blob_columns_);
     if (!s.ok()) {
       status_ = s;
       validity_info_.Invalidate();
@@ -1669,7 +1670,7 @@ bool CompactionIterator::FetchBlobsNeedingGC(
     Status s = blob_fetcher_->FetchBlob(user_key(), blob_index, prefetch_buffer,
                                         &blob_value, &bytes_read);
     if (!s.ok()) {
-      status_ = s;
+      status_ = std::move(s);
       validity_info_.Invalidate();
       return false;
     }
@@ -1817,8 +1818,8 @@ void CompactionIterator::GarbageCollectEntityBlobsIfNeeded() {
     Slice entity_slice = value_;
     entity_columns_.clear();
     entity_blob_columns_.clear();
-    Status s = WideColumnSerialization::DeserializeV2(
-        entity_slice, entity_columns_, entity_blob_columns_);
+    Status s = WideColumnSerialization::Deserialize(
+        entity_slice, entity_columns_, &entity_blob_columns_);
     if (!s.ok()) {
       status_ = s;
       validity_info_.Invalidate();
@@ -1869,13 +1870,13 @@ void CompactionIterator::PrepareOutput() {
               "CompactionIterator::PrepareOutput:DeserializeEntity");
           // Deserialize entity once into member variables, then decide between
           // blob GC and extraction based on whether blob columns exist.
-          // This avoids the double parse of HasBlobColumns() + DeserializeV2().
+          // This avoids the double parse of HasBlobColumns() + Deserialize().
           entity_columns_.clear();
           entity_blob_columns_.clear();
           Slice entity_slice = value_;
           {
-            Status s_deser = WideColumnSerialization::DeserializeV2(
-                entity_slice, entity_columns_, entity_blob_columns_);
+            Status s_deser = WideColumnSerialization::Deserialize(
+                entity_slice, entity_columns_, &entity_blob_columns_);
             if (!s_deser.ok()) {
               status_ = s_deser;
               validity_info_.Invalidate();
@@ -1908,8 +1909,7 @@ void CompactionIterator::PrepareOutput() {
     // KeyNotExistsBeyondOutputLevel() return true?
     if (Valid() && bottommost_level_ &&
         DefinitelyInSnapshot(ikey_.sequence, earliest_snapshot_) &&
-        ikey_.type != kTypeMerge && current_key_committed_ &&
-        ikey_.sequence <= preserve_seqno_after_ && !is_range_del_) {
+        ikey_.type != kTypeMerge && current_key_committed_ && !is_range_del_) {
       assert(compaction_ != nullptr && !compaction_->allow_ingest_behind());
       if (ikey_.type == kTypeDeletion ||
           (ikey_.type == kTypeSingleDeletion && timestamp_size_ == 0)) {
@@ -1931,19 +1931,29 @@ void CompactionIterator::PrepareOutput() {
       }
 
       bool zeroed_seqno = false;
-      if (!timestamp_size_) {
-        current_key_.UpdateInternalKey(0, ikey_.type);
-        zeroed_seqno = true;
-      } else if (full_history_ts_low_ && cmp_with_history_ts_low_ < 0) {
-        // For UDT, the seqno and timestamp could only be zeroed out after the
-        // key is below history_ts_low_.
-        // For the same user key (excluding timestamp), the timestamp-based
-        // history can be collapsed to save some space if the timestamp is
-        // older than *full_history_ts_low_.
-        const std::string kTsMin(timestamp_size_, static_cast<char>(0));
-        const Slice ts_slice = kTsMin;
-        ikey_.SetTimestamp(ts_slice);
-        current_key_.UpdateInternalKey(0, ikey_.type, &ts_slice);
+      // Whether the sequence number can actually be zeroed out here is decided
+      // by the shared BottommostSeqnoCanBeZeroed() predicate, which the
+      // bottommost-file marking logic
+      // (VersionStorageInfo::ComputeBottommostFilesMarkedForCompaction) also
+      // consults. Keeping both on one predicate ensures a file is only marked
+      // for a compaction that can make progress; otherwise the file would be
+      // re-marked forever (infinite compaction loop).
+      if (BottommostSeqnoCanBeZeroed(
+              ikey_.sequence, preserve_seqno_after_, timestamp_size_,
+              full_history_ts_low_ != nullptr, cmp_with_history_ts_low_ < 0)) {
+        if (!timestamp_size_) {
+          current_key_.UpdateInternalKey(0, ikey_.type);
+        } else {
+          // For UDT, the seqno and timestamp could only be zeroed out after the
+          // key is below history_ts_low_.
+          // For the same user key (excluding timestamp), the timestamp-based
+          // history can be collapsed to save some space if the timestamp is
+          // older than *full_history_ts_low_.
+          const std::string kTsMin(timestamp_size_, static_cast<char>(0));
+          const Slice ts_slice = kTsMin;
+          ikey_.SetTimestamp(ts_slice);
+          current_key_.UpdateInternalKey(0, ikey_.type, &ts_slice);
+        }
         zeroed_seqno = true;
       }
 
@@ -2064,8 +2074,9 @@ std::unique_ptr<BlobFetcher> CompactionIterator::CreateBlobFetcherIfNeeded(
     }
   }
 
-  return std::unique_ptr<BlobFetcher>(new BlobFetcher(
-      version, read_options, blob_file_cache, allow_write_path_fallback));
+  return std::unique_ptr<BlobFetcher>(
+      new OwningVersionBlobFetcher(version, std::move(read_options),
+                                   blob_file_cache, allow_write_path_fallback));
 }
 
 std::unique_ptr<PrefetchBufferCollection>

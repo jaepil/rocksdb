@@ -130,6 +130,14 @@ DEFINE_bool(enable_pipelined_write, false, "Pipeline WAL/memtable writes");
 
 DEFINE_bool(verify_before_write, false, "Verify before write");
 
+DEFINE_string(
+    verify_cpu_corruption_dir, "",
+    "When non-empty, activates a slow, meticulous verification mode intended "
+    "only for use with a CPU fault injector; on the first corruption found it "
+    "writes a result file here and fails the run. See "
+    "StressTest::MaybeVerifyCpuCorruption for the full behavior and "
+    "output-file contract. Empty (default) = off.");
+
 DEFINE_bool(histogram, false, "Print histogram of operation timings");
 
 DEFINE_bool(destroy_db_initially, true,
@@ -147,6 +155,16 @@ DEFINE_bool(verbose, false, "Verbose");
 
 DEFINE_bool(progress_reports, true,
             "If true, db_stress will report number of finished operations");
+
+DEFINE_uint64(
+    liveness_check_interval_sec, 0,
+    "If non-zero, check periodically whether db_stress operations are making "
+    "progress. Requires --liveness_no_progress_timeout_sec to be non-zero.");
+
+DEFINE_uint64(
+    liveness_no_progress_timeout_sec, 0,
+    "If non-zero with --liveness_check_interval_sec, terminate db_stress when "
+    "no operation completes for this many seconds during the operation phase.");
 
 DEFINE_uint64(db_write_buffer_size,
               ROCKSDB_NAMESPACE::Options().db_write_buffer_size,
@@ -519,6 +537,13 @@ DEFINE_uint64(blob_file_size,
               ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions().blob_file_size,
               "[Integrated BlobDB] The size limit for blob files.");
 
+DEFINE_uint64(
+    blob_file_writable_file_max_buffer_size,
+    ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
+        .blob_file_writable_file_max_buffer_size,
+    "[Integrated BlobDB] Max WritableFileWriter buffer size for blob files. "
+    "0 means inherit writable_file_max_buffer_size.");
+
 DEFINE_string(blob_compression_type, "none",
               "[Integrated BlobDB] The compression algorithm to use for large "
               "values stored in blob files.");
@@ -659,6 +684,13 @@ DEFINE_int32(
         ROCKSDB_NAMESPACE::BlockBasedTableOptions().data_block_index_type),
     "Index type for data blocks (see `enum DataBlockIndexType` in table.h)");
 
+DEFINE_int32(optimize_key_common_prefix,
+             static_cast<int32_t>(ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+                                      .optimize_key_common_prefix),
+             "When/whether data blocks store the common user-key prefix once "
+             "(see `enum OptimizeKeyCommonPrefix` in table.h): 0=kDisabled, "
+             "1=kIfFastSeek, 2=kEnabled. Requires format_version >= 8.");
+
 DEFINE_int32(index_block_search_type,
              static_cast<int32_t>(ROCKSDB_NAMESPACE::BlockBasedTableOptions()
                                       .index_block_search_type),
@@ -696,6 +728,14 @@ DEFINE_bool(test_secondary, false,
             "If true, start an additional secondary instance which can be used "
             "for verification.");
 
+DEFINE_int32(open_read_only_one_in, 0,
+             "If greater than 0, on thread 0 with probability 1/N per "
+             "operation, open a read-only DB instance on the primary's live "
+             "directory, flush the primary, then close the reader. Stresses "
+             "concurrent primary + read-only DB on the same directory to guard "
+             "against a read-only DB's close deleting the primary's live SST "
+             "files. 0 disables.");
+
 DEFINE_string(
     expected_values_dir, "",
     "Dir where files containing info about the latest/historical values will "
@@ -705,20 +745,6 @@ DEFINE_string(
     "that use the same --expected_values_dir. Currently historical values are "
     "only tracked when --sync_fault_injection is set. See --seed and "
     "--nooverwritepercent for further requirements.");
-
-DEFINE_bool(expected_state_trace_debug, true,
-            "If true, print debug logs while replaying expected-state trace "
-            "records during crash recovery verification.");
-
-DEFINE_int64(
-    expected_state_trace_debug_key, -1,
-    "If non-negative, restrict expected-state trace debug logs to the "
-    "specified logical key where possible. Raw-key roundtrip mismatches for "
-    "that logical key are still logged.");
-
-DEFINE_int32(expected_state_trace_debug_max_logs, 200,
-             "Maximum number of expected-state trace debug log lines to emit "
-             "per restore attempt.");
 
 DEFINE_bool(verify_checksum, false,
             "Verify checksum for every block read from storage");
@@ -859,6 +885,25 @@ DEFINE_int32(checkpoint_one_in, 0,
              "every N operations on average.  0 indicates CreateCheckpoint() "
              "is disabled.");
 
+DEFINE_int32(checkpoint_engine_max_background_operations, 1,
+             "Background-thread parallelism of the shared CheckpointEngine "
+             "(always opened). Values <= 0 are treated as 1.");
+
+DEFINE_bool(checkpoint_engine_use_link_file_when_available, true,
+            "Whether the parallel CheckpointEngine may hard-link data files "
+            "instead of copying them. False forces the parallel copy path.");
+
+DEFINE_int32(parallel_checkpoint_one_in, 0,
+             "Each checkpoint uses the parallel CheckpointEngine with "
+             "probability 1/N, else the legacy serial API (0 = always serial, "
+             "1 = always parallel).");
+
+DEFINE_int32(subset_cf_checkpoint_one_in, 0,
+             "Each checkpoint covers only a random proper subset of the column "
+             "families with probability 1/N (0 = always all column families, "
+             "1 = always a subset). Ignored when there is only the default "
+             "column family.");
+
 DEFINE_int32(ingest_external_file_one_in, 0,
              "If non-zero, then IngestExternalFile() will be called once for "
              "every N operations on average.  0 indicates IngestExternalFile() "
@@ -866,6 +911,34 @@ DEFINE_int32(ingest_external_file_one_in, 0,
 
 DEFINE_int32(ingest_external_file_width, 100,
              "The width of the ingested external files.");
+
+DEFINE_int32(ingest_external_file_prepare_commit_one_in, 0,
+             "If non-zero, an ingestion that would call IngestExternalFile() "
+             "instead uses the two-phase PrepareFileIngestion()/"
+             "CommitFileIngestion() API once for every N such ingestions on "
+             "average, occasionally dropping the prepared handle without "
+             "committing to exercise the rollback path. 0 disables it.");
+
+DEFINE_int32(ingest_external_file_use_file_info_one_in, 0,
+             "If non-zero, the ingestexternalfile flow reuses each file's "
+             "metadata via IngestExternalFileArg::file_infos (from "
+             "SstFileWriter::Finish) once every N ingestions on average, so "
+             "ingestion skips re-opening and scanning the files.");
+
+DEFINE_int32(
+    ingest_external_file_atomic_replace_one_in, 0,
+    "If non-zero, file ingestion atomically replaces a range strictly inside "
+    "an existing SST once every N ingestion operations on average. Requires "
+    "universal compaction, ingest_external_file_width >= 2, no user-defined "
+    "timestamps, and no acquired snapshots.");
+
+DEFINE_bool(
+    ingest_external_file_with_embedded_blobs, false,
+    "If true, external files for ingestion are written with embedded "
+    "blobs via SstFileWriter::OpenWithEmbeddedBlobs(). min_blob_size is "
+    "set so that only the largest generated values are embedded. "
+    "Requires block-based table format_version >= 7 and "
+    "ingest_external_file_one_in > 0.");
 
 DEFINE_int32(compact_files_one_in, 0,
              "If non-zero, then CompactFiles() will be called once for every N "
@@ -914,6 +987,11 @@ DEFINE_int32(abort_and_resume_compactions_one_in, 0,
              "If non-zero, then AbortAllCompactions()+Resume will be called "
              "once for every N ops on average. 0 disables.");
 
+DEFINE_int32(abort_and_resume_cf_compactions_one_in, 0,
+             "If non-zero, then AbortCompactions(cf)+ResumeCompactions(cf) "
+             "will be called on a random column family once for every N ops "
+             "on average. 0 disables.");
+
 DEFINE_int32(compact_range_width, 10000,
              "The width of the ranges passed to CompactRange().");
 
@@ -932,15 +1010,30 @@ DEFINE_uint64(snapshot_hold_ops, 0,
 DEFINE_bool(long_running_snapshots, false,
             "If set, hold on some some snapshots for much longer time.");
 
-// The following three options affect both regular read operations during the
+// The following four options affect both regular read operations during the
 // test and initial/final database verification through VerifyDB.
 DEFINE_bool(use_multiget, false,
             "If set, use the batched MultiGet API for reads.");
+
+DEFINE_bool(use_async_db_api, false,
+            "If set, use DB::GetAsync and DB::MultiGetAsync for reads.");
 
 DEFINE_bool(use_get_entity, false, "If set, use the GetEntity API for reads.");
 
 DEFINE_bool(use_multi_get_entity, false,
             "If set, use the MultiGetEntity API for reads.");
+
+DEFINE_int32(
+    lazy_entity_read_one_in, 0,
+    "If greater than 0, then on roughly 1/N of GetEntity / MultiGetEntity "
+    "operations, additionally read the same key(s) via the lazy wide-column "
+    "API "
+    "(GetEntityLazy / MultiGetEntityLazy) under a pinned snapshot and verify "
+    "the "
+    "lazily-resolved columns (a random subset, possibly none) match the eager "
+    "GetEntity result. Only takes effect when open_files == -1 (required by "
+    "the "
+    "lazy API), user_timestamp_size == 0, and not using transactions.");
 
 DEFINE_int32(test_ingest_standalone_range_deletion_one_in, 0,
              "If non-zero, file ingestion flow will test standalone range "
@@ -966,6 +1059,12 @@ DEFINE_int32(remote_compaction_worker_interval, 10,
 DEFINE_bool(remote_compaction_failure_fall_back_to_local, true,
             "If true, remote compaction failures will be ignored and "
             "compactions will fall back to local and retried");
+
+DEFINE_uint32(
+    openandcompact_max_secondary_open_retries,
+    ROCKSDB_NAMESPACE::OpenAndCompactOptions().max_secondary_open_retries,
+    "Maximum number of retries when OpenAndCompact opens the source DB as a "
+    "secondary");
 
 DEFINE_int32(allow_resumption_one_in, 0,
              "If non-zero, enable resumable compaction with 1/N probability "
@@ -1026,7 +1125,8 @@ DEFINE_int32(iterpercent, 10,
 static const bool FLAGS_iterpercent_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_iterpercent, &ValidateInt32Percent);
 
-DEFINE_uint64(num_iterations, 10, "Number of iterations per MultiIterate run");
+DEFINE_uint64(num_iterations, 10,
+              "Number of iterations per iterator or MultiScan run");
 static const bool FLAGS_num_iterations_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_num_iterations, &ValidateUint32Range);
 
@@ -1052,6 +1152,15 @@ DEFINE_uint64(compression_max_dict_buffer_bytes, 0,
               "Buffering limit for SST file data to sample for dictionary "
               "compression.");
 
+DEFINE_bool(compression_auto_skip, false,
+            "Enable AutoSkip compression: stop attempting compression on data "
+            "blocks once it is not paying off (reuses max_compressed_bytes_per_"
+            "kb as the bar).");
+
+DEFINE_int32(compression_auto_skip_min_sample_every, 0,
+             "AutoSkip nominal sampling interval (skipped data blocks between "
+             "forced compression samples). 0 selects an internal default.");
+
 DEFINE_bool(
     compression_use_zstd_dict_trainer, true,
     "Use zstd's trainer to generate dictionary. If the options is false, "
@@ -1075,6 +1184,13 @@ DEFINE_string(fs_uri, "",
               "URI for registry Filesystem lookup. Mutually exclusive"
               " with --env_uri."
               " Creates a default environment with the specified filesystem.");
+
+DEFINE_bool(
+    tolerate_non_injected_io_errors_for_remote_dbs, false,
+    "Treat non-injected, non-data-loss IO errors as retryable. Intended "
+    "only for remote DBs (--env_uri / --fs_uri) where infrastructure "
+    "can return transient IO errors; db_crashtest.py forces it off for "
+    "local DBs so real local IO errors are not masked.");
 
 DEFINE_uint64(ops_per_thread, 1200000, "Number of operations per thread.");
 static const bool FLAGS_ops_per_thread_dummy __attribute__((__unused__)) =
@@ -1393,6 +1509,11 @@ DEFINE_uint64(
     ROCKSDB_NAMESPACE::Options().max_compaction_trigger_wakeup_seconds,
     "Sets DB option max_compaction_trigger_wakeup_seconds.");
 
+DEFINE_int32(
+    periodic_compaction_phase_recovery_percent,
+    ROCKSDB_NAMESPACE::Options().periodic_compaction_phase_recovery_percent,
+    "Sets DB option periodic_compaction_phase_recovery_percent.");
+
 DEFINE_bool(verification_only, false,
             "If true, tests will only execute verification step");
 extern "C" bool RocksDbIOUringEnable() { return true; }
@@ -1706,6 +1827,11 @@ DEFINE_bool(
 
 DEFINE_bool(use_multiscan, false,
             "If set, use the batched MultiScan API for scans.");
+
+DEFINE_bool(multiscan_reverse, false,
+            "If set with use_multiscan, scan each MultiScan range in reverse "
+            "using SeekForPrev and Prev. This does not require "
+            "test_backward_scan.");
 
 DEFINE_bool(multiscan_use_async_io, false,
             "If set, enable async_io for MultiScan operations.");

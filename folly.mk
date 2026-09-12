@@ -23,7 +23,6 @@ $(error Please specify only one of USE_FOLLY and USE_FOLLY_LITE)
 endif
 ifneq ($(strip $(FOLLY_PATH)),)
 	BOOST_PATH = $(shell (ls -d $(FOLLY_PATH)/../boost*))
-	DBL_CONV_PATH = $(shell (ls -d $(FOLLY_PATH)/../double-conversion*))
 	GFLAGS_PATH = $(shell (ls -d $(FOLLY_PATH)/../gflags*))
 	GLOG_PATH = $(shell (ls -d $(FOLLY_PATH)/../glog*))
 	LIBEVENT_PATH = $(shell (ls -d $(FOLLY_PATH)/../libevent*))
@@ -31,27 +30,28 @@ ifneq ($(strip $(FOLLY_PATH)),)
 	LIBSODIUM_PATH = $(shell (ls -d $(FOLLY_PATH)/../libsodium*))
 	FMT_PATH = $(shell (ls -d $(FOLLY_PATH)/../fmt*))
 
-	# For some reason, glog and fmt libraries are under either lib or lib64
+	# For some reason, some libraries are under either lib or lib64
 	GLOG_LIB_PATH = $(shell (ls -d $(GLOG_PATH)/lib*))
 	FMT_LIB_PATH = $(shell (ls -d $(FMT_PATH)/lib*))
+	LIBEVENT_LIB_PATH = $(shell (ls -d $(LIBEVENT_PATH)/lib*))
 
 	# AIX: pre-defined system headers are surrounded by an extern "C" block
 	ifeq ($(PLATFORM), OS_AIX)
-		PLATFORM_CCFLAGS += -I$(BOOST_PATH)/include -I$(DBL_CONV_PATH)/include -I$(GLOG_PATH)/include -I$(LIBEVENT_PATH)/include -I$(XZ_PATH)/include -I$(LIBSODIUM_PATH)/include -I$(FOLLY_PATH)/include -I$(FMT_PATH)/include
-		PLATFORM_CXXFLAGS += -I$(BOOST_PATH)/include -I$(DBL_CONV_PATH)/include -I$(GLOG_PATH)/include -I$(LIBEVENT_PATH)/include -I$(XZ_PATH)/include -I$(LIBSODIUM_PATH)/include -I$(FOLLY_PATH)/include -I$(FMT_PATH)/include
+		PLATFORM_CCFLAGS += -I$(BOOST_PATH)/include -I$(GLOG_PATH)/include -I$(LIBEVENT_PATH)/include -I$(XZ_PATH)/include -I$(LIBSODIUM_PATH)/include -I$(FOLLY_PATH)/include -I$(FMT_PATH)/include
+		PLATFORM_CXXFLAGS += -I$(BOOST_PATH)/include -I$(GLOG_PATH)/include -I$(LIBEVENT_PATH)/include -I$(XZ_PATH)/include -I$(LIBSODIUM_PATH)/include -I$(FOLLY_PATH)/include -I$(FMT_PATH)/include
 	else
-		PLATFORM_CCFLAGS += -isystem $(BOOST_PATH)/include -isystem $(DBL_CONV_PATH)/include -isystem $(GLOG_PATH)/include -isystem $(LIBEVENT_PATH)/include -isystem $(XZ_PATH)/include -isystem $(LIBSODIUM_PATH)/include -isystem $(FOLLY_PATH)/include -isystem $(FMT_PATH)/include
-		PLATFORM_CXXFLAGS += -isystem $(BOOST_PATH)/include -isystem $(DBL_CONV_PATH)/include -isystem $(GLOG_PATH)/include -isystem $(LIBEVENT_PATH)/include -isystem $(XZ_PATH)/include -isystem $(LIBSODIUM_PATH)/include -isystem $(FOLLY_PATH)/include -isystem $(FMT_PATH)/include
+		PLATFORM_CCFLAGS += -isystem $(BOOST_PATH)/include -isystem $(GLOG_PATH)/include -isystem $(LIBEVENT_PATH)/include -isystem $(XZ_PATH)/include -isystem $(LIBSODIUM_PATH)/include -isystem $(FOLLY_PATH)/include -isystem $(FMT_PATH)/include
+		PLATFORM_CXXFLAGS += -isystem $(BOOST_PATH)/include -isystem $(GLOG_PATH)/include -isystem $(LIBEVENT_PATH)/include -isystem $(XZ_PATH)/include -isystem $(LIBSODIUM_PATH)/include -isystem $(FOLLY_PATH)/include -isystem $(FMT_PATH)/include
 	endif
 
 	# Add -ldl at the end as gcc resolves a symbol in a library by searching only in libraries specified later
 	# in the command line
 
-	PLATFORM_LDFLAGS += $(FOLLY_PATH)/lib/libfolly.a $(BOOST_PATH)/lib/libboost_context.a $(BOOST_PATH)/lib/libboost_filesystem.a $(BOOST_PATH)/lib/libboost_atomic.a $(BOOST_PATH)/lib/libboost_program_options.a $(BOOST_PATH)/lib/libboost_regex.a $(BOOST_PATH)/lib/libboost_system.a $(BOOST_PATH)/lib/libboost_thread.a $(DBL_CONV_PATH)/lib/libdouble-conversion.a $(LIBEVENT_PATH)/lib/libevent.a $(LIBSODIUM_PATH)/lib/libsodium.a -ldl
+	PLATFORM_LDFLAGS += $(FOLLY_PATH)/lib/libfolly.a $(BOOST_PATH)/lib/libboost_context.a $(BOOST_PATH)/lib/libboost_filesystem.a $(BOOST_PATH)/lib/libboost_atomic.a $(BOOST_PATH)/lib/libboost_program_options.a $(BOOST_PATH)/lib/libboost_regex.a $(BOOST_PATH)/lib/libboost_system.a $(BOOST_PATH)/lib/libboost_thread.a $(LIBEVENT_LIB_PATH)/libevent.a $(LIBSODIUM_PATH)/lib/libsodium.a -ldl
 ifneq ($(DEBUG_LEVEL),0)
-	PLATFORM_LDFLAGS += $(FMT_LIB_PATH)/libfmtd.a $(GLOG_LIB_PATH)/libglogd.so $(GFLAGS_PATH)/lib/libgflags_debug.so.2.2
+	PLATFORM_LDFLAGS += $(FMT_LIB_PATH)/libfmtd.a $(GLOG_LIB_PATH)/libglogd.so $(GFLAGS_PATH)/lib/libgflags_debug.so.2.3
 else
-	PLATFORM_LDFLAGS += $(FMT_LIB_PATH)/libfmt.a $(GLOG_LIB_PATH)/libglog.so $(GFLAGS_PATH)/lib/libgflags.so.2.2
+	PLATFORM_LDFLAGS += $(FMT_LIB_PATH)/libfmt.a $(GLOG_LIB_PATH)/libglog.so $(GFLAGS_PATH)/lib/libgflags.so.2.3
 endif
 	PLATFORM_LDFLAGS += -Wl,-rpath=$(GLOG_LIB_PATH) -Wl,-rpath=$(GFLAGS_PATH)/lib
 endif
@@ -98,7 +98,7 @@ endif  # FMT_SOURCE_PATH
 	PLATFORM_LDFLAGS += -lglog
 endif
 
-FOLLY_COMMIT_HASH = 548b16da0b3cc887d69cdb6ae06496ad8a2a9276
+FOLLY_COMMIT_HASH = 2a68075b77d958854d895e78fe6c41940dd49f3c
 FOLLY_GETDEPS_CACHE_DIR = /tmp/rocksdb-getdeps-cache
 
 define restore_folly_getdeps_downloads
@@ -140,10 +140,16 @@ checkout_folly:
 	perl -pi -e 's/(#include <atomic>)/$$1\n#include <cstring>/' third-party/folly/folly/lang/Exception.h
 	@# const mismatch
 	perl -pi -e 's/: environ/: (const char**)(environ)/' third-party/folly/folly/Subprocess.cpp
+	@# Pagure was decommissioned; use Debian's mirror of the release archive.
+	perl -pi -e 's|https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz|https://deb.debian.org/debian/pool/main/liba/libaio/libaio_0.3.113.orig.tar.gz|; s|716c7059703247344eb066b54ecbc3ca2134f0103307192e6c2b7dab5f9528ab|2c44d1c5fd0d43752287c9ae1eb9c023f04ef848ea8d4aafa46e9aedb678200b|; s|subdir = libaio-libaio-0.3.113|subdir = libaio-0.3.113|' third-party/folly/build/fbcode_builder/manifests/libaio
 	@# Restore cached downloads and handle unreliable mirrors with fallback
 	$(restore_folly_getdeps_downloads)
 	@# NOTE: boost and fmt source will be needed for any build including `USE_FOLLY_LITE` builds as those depend on those headers
-	cd third-party/folly && GETDEPS_USE_WGET=1 $(PYTHON) build/fbcode_builder/getdeps.py fetch boost && GETDEPS_USE_WGET=1 $(PYTHON) build/fbcode_builder/getdeps.py fetch fmt
+	@# Prefetch libaio so its source archive is also saved in the getdeps cache.
+	cd third-party/folly && \
+		for dep in boost fmt libaio; do \
+			GETDEPS_USE_WGET=1 $(PYTHON) build/fbcode_builder/getdeps.py fetch $$dep || exit 1; \
+		done
 	@# Update cache with any new downloads
 	$(cache_folly_getdeps_downloads)
 

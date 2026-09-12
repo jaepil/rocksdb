@@ -41,6 +41,7 @@
 #include "db_stress_tool/db_stress_env_wrapper.h"
 #include "db_stress_tool/db_stress_listener.h"
 #include "db_stress_tool/db_stress_shared_state.h"
+#include "db_stress_tool/db_stress_status.h"
 #include "db_stress_tool/db_stress_test_base.h"
 #include "logging/logging.h"
 #include "monitoring/histogram.h"
@@ -184,6 +185,7 @@ DECLARE_uint32(sqfc_version);
 DECLARE_bool(use_sqfc_for_range_queries);
 DECLARE_int32(index_type);
 DECLARE_int32(data_block_index_type);
+DECLARE_int32(optimize_key_common_prefix);
 DECLARE_int32(index_block_search_type);
 DECLARE_double(uniform_cv_threshold);
 DECLARE_bool(use_trie_index);
@@ -192,6 +194,7 @@ DECLARE_bool(test_backward_scan);
 DECLARE_string(db);
 DECLARE_string(secondaries_base);
 DECLARE_bool(test_secondary);
+DECLARE_int32(open_read_only_one_in);
 DECLARE_string(expected_values_dir);
 DECLARE_int32(num_dbs);
 DECLARE_bool(expected_state_trace_debug);
@@ -209,6 +212,7 @@ DECLARE_bool(sync);
 DECLARE_bool(use_fsync);
 DECLARE_uint64(stats_dump_period_sec);
 DECLARE_uint64(max_compaction_trigger_wakeup_seconds);
+DECLARE_int32(periodic_compaction_phase_recovery_percent);
 DECLARE_uint64(bytes_per_sync);
 DECLARE_uint64(wal_bytes_per_sync);
 DECLARE_int32(kill_random_test);
@@ -227,8 +231,16 @@ DECLARE_uint64(sst_file_manager_bytes_per_truncate);
 DECLARE_int32(backup_one_in);
 DECLARE_uint64(backup_max_size);
 DECLARE_int32(checkpoint_one_in);
+DECLARE_int32(checkpoint_engine_max_background_operations);
+DECLARE_bool(checkpoint_engine_use_link_file_when_available);
+DECLARE_int32(parallel_checkpoint_one_in);
+DECLARE_int32(subset_cf_checkpoint_one_in);
 DECLARE_int32(ingest_external_file_one_in);
 DECLARE_int32(ingest_external_file_width);
+DECLARE_int32(ingest_external_file_prepare_commit_one_in);
+DECLARE_int32(ingest_external_file_use_file_info_one_in);
+DECLARE_int32(ingest_external_file_atomic_replace_one_in);
+DECLARE_bool(ingest_external_file_with_embedded_blobs);
 DECLARE_int32(compact_files_one_in);
 DECLARE_int32(compact_range_one_in);
 DECLARE_int32(promote_l0_one_in);
@@ -240,14 +252,17 @@ DECLARE_int32(pause_background_one_in);
 DECLARE_int32(disable_file_deletions_one_in);
 DECLARE_int32(disable_manual_compaction_one_in);
 DECLARE_int32(abort_and_resume_compactions_one_in);
+DECLARE_int32(abort_and_resume_cf_compactions_one_in);
 DECLARE_int32(compact_range_width);
 DECLARE_int32(acquire_snapshot_one_in);
 DECLARE_bool(compare_full_db_state_snapshot);
 DECLARE_uint64(snapshot_hold_ops);
 DECLARE_bool(long_running_snapshots);
 DECLARE_bool(use_multiget);
+DECLARE_bool(use_async_db_api);
 DECLARE_bool(use_get_entity);
 DECLARE_bool(use_multi_get_entity);
+DECLARE_int32(lazy_entity_read_one_in);
 DECLARE_int32(readpercent);
 DECLARE_int32(prefixpercent);
 DECLARE_int32(writepercent);
@@ -263,6 +278,8 @@ DECLARE_int32(compression_max_dict_bytes);
 DECLARE_int32(compression_zstd_max_train_bytes);
 DECLARE_int32(compression_parallel_threads);
 DECLARE_uint64(compression_max_dict_buffer_bytes);
+DECLARE_bool(compression_auto_skip);
+DECLARE_int32(compression_auto_skip_min_sample_every);
 DECLARE_bool(compression_use_zstd_dict_trainer);
 DECLARE_bool(compression_checksum);
 DECLARE_string(checksum_type);
@@ -335,6 +352,7 @@ DECLARE_bool(enable_blob_direct_write);
 DECLARE_uint64(blob_direct_write_partitions);
 DECLARE_uint64(min_blob_size);
 DECLARE_uint64(blob_file_size);
+DECLARE_uint64(blob_file_writable_file_max_buffer_size);
 DECLARE_string(blob_compression_type);
 DECLARE_bool(enable_blob_garbage_collection);
 DECLARE_double(blob_garbage_collection_age_cutoff);
@@ -350,6 +368,7 @@ DECLARE_int32(prepopulate_blob_cache);
 DECLARE_int32(approximate_size_one_in);
 DECLARE_bool(best_efforts_recovery);
 DECLARE_bool(skip_verifydb);
+DECLARE_string(verify_cpu_corruption_dir);
 DECLARE_bool(paranoid_file_checks);
 DECLARE_uint64(batch_protection_bytes_per_key);
 DECLARE_uint32(memtable_protection_bytes_per_key);
@@ -458,6 +477,7 @@ DECLARE_bool(track_and_verify_wals);
 DECLARE_int32(remote_compaction_worker_threads);
 DECLARE_int32(remote_compaction_worker_interval);
 DECLARE_bool(remote_compaction_failure_fall_back_to_local);
+DECLARE_uint32(openandcompact_max_secondary_open_retries);
 DECLARE_int32(allow_resumption_one_in);
 DECLARE_bool(auto_refresh_iterator_with_snapshot);
 DECLARE_uint32(memtable_op_scan_flush_trigger);
@@ -466,6 +486,7 @@ DECLARE_uint32(min_tombstones_for_range_conversion);
 DECLARE_uint32(ingest_wbwi_one_in);
 DECLARE_bool(universal_reduce_file_locking);
 DECLARE_bool(use_multiscan);
+DECLARE_bool(multiscan_reverse);
 DECLARE_bool(multiscan_use_async_io);
 DECLARE_bool(read_scoped_block_buffer_provider);
 DECLARE_uint64(multiscan_max_prefetch_memory_bytes);
@@ -811,6 +832,8 @@ void PoolSizeChangeThread(void* v);
 
 void DbVerificationThread(void* v);
 
+void LivenessWatchdogThread(void* v);
+
 void RemoteCompactionWorkerThread(void* v);
 
 void CompressedCacheSetCapacityThread(void* v);
@@ -839,6 +862,19 @@ AttributeGroups GenerateAttributeGroups(
     const std::vector<ColumnFamilyHandle*>& cfhs, uint32_t value_base,
     const Slice& slice);
 
+Status DbStressGet(DB* db, const ReadOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   PinnableSlice* value, std::string* timestamp = nullptr);
+Status DbStressGet(DB* db, const ReadOptions& options,
+                   ColumnFamilyHandle* column_family, const Slice& key,
+                   std::string* value, std::string* timestamp = nullptr);
+Status DbStressGet(DB* db, const ReadOptions& options, const Slice& key,
+                   std::string* value);
+void DbStressMultiGet(DB* db, const ReadOptions& options,
+                      ColumnFamilyHandle* column_family, size_t num_keys,
+                      const Slice* keys, PinnableSlice* values,
+                      Status* statuses);
+
 StressTest* CreateCfConsistencyStressTest(int db_index,
                                           const std::string& db_path,
                                           const std::string& ev_path,
@@ -859,6 +895,8 @@ void InitializeHotKeyGenerator(double alpha);
 int64_t GetOneHotKeyID(double rand_seed, int64_t max_key);
 
 std::string GetNowNanos();
+
+std::string GetReadTimestamp();
 
 uint64_t GetWriteUnixTime(ThreadState* thread);
 

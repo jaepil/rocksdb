@@ -482,7 +482,9 @@ class Repairer {
           current_time /* newest_key_time */, false /* is_bottommost */,
           TableFileCreationReason::kRecovery, 0 /* oldest_key_time */,
           0 /* file_creation_time */, "DB Repairer" /* db_id */, db_session_id_,
-          0 /*target_file_size*/, meta.fd.GetNumber());
+          0 /*target_file_size*/, meta.fd.GetNumber(),
+          kMaxSequenceNumber /*last_level_inclusive_max_seqno_threshold*/,
+          dbname_ /*db_name*/);
 
       SeqnoToTimeMapping empty_seqno_to_time_mapping;
       status = BuildTable(
@@ -699,7 +701,8 @@ class Repairer {
           nullptr /* src_vstorage */, cfd->ioptions().force_consistency_checks,
           EpochNumberRequirement::kMightMissing, cfd->ioptions().clock,
           /*bottommost_file_compaction_delay=*/0,
-          cfd->current()->version_set()->offpeak_time_option());
+          cfd->current()->version_set()->offpeak_time_option(),
+          PeriodicCompactionPhaseParams{});
       Status s;
       VersionEdit dummy_edit;
       for (const auto* table : cf_id_and_tables.second) {

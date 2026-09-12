@@ -243,6 +243,11 @@ Status DBImpl::ValidateOptions(
 }
 
 Status DBImpl::ValidateOptions(const DBOptions& db_options) {
+  if (db_options.read_io_executor_threads <= 0) {
+    return Status::InvalidArgument(
+        "read_io_executor_threads must be greater than zero");
+  }
+
   if (db_options.db_paths.size() > 4) {
     return Status::NotSupported(
         "More than four DB paths are not supported yet. ");
@@ -683,7 +688,8 @@ Status DBImpl::Recover(
                            f->file_checksum, f->file_checksum_func_name,
                            f->unique_id, f->compensated_range_deletion_size,
                            f->tail_size, f->user_defined_timestamps_persisted,
-                           f->min_timestamp, f->max_timestamp);
+                           f->min_timestamp, f->max_timestamp,
+                           f->file_open_metadata);
               ROCKS_LOG_WARN(immutable_db_options_.info_log,
                              "[%s] Moving #%" PRIu64
                              " from from_level-%d to from_level-%d %" PRIu64
@@ -1028,7 +1034,7 @@ Status DBImpl::InitPersistStatsColumnFamily() {
   return s;
 }
 
-Status DBImpl::LogAndApplyForRecovery(const RecoveryContext& recovery_ctx) {
+Status DBImpl::LogAndApplyForRecovery(RecoveryContext& recovery_ctx) {
   mutex_.AssertHeld();
   // descriptor_log_ is normally null after Recover, but when
   // reuse_manifest_on_open is set VersionSet::Recover may have already
@@ -1038,9 +1044,21 @@ Status DBImpl::LogAndApplyForRecovery(const RecoveryContext& recovery_ctx) {
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
   const WriteOptions write_options(Env::IOActivity::kDBOpen);
 
+  if (versions_->force_new_manifest_on_open_ &&
+      !recovery_ctx.HasVersionEdits()) {
+    VersionEdit edit;
+    ColumnFamilyData* default_cfd =
+        versions_->GetColumnFamilySet()->GetDefault();
+    assert(default_cfd);
+    recovery_ctx.UpdateVersionEdits(default_cfd, edit);
+  }
+
   Status s = versions_->LogAndApply(recovery_ctx.cfds_, read_options,
                                     write_options, recovery_ctx.edit_lists_,
                                     &mutex_, directories_.GetDbDir());
+  if (s.ok()) {
+    versions_->force_new_manifest_on_open_ = false;
+  }
   return s;
 }
 
@@ -1941,10 +1959,8 @@ Status DBImpl::MaybeFlushFinalMemtableOrRestoreActiveLogFiles(
         const uint64_t new_min_log = max_wal_number + 1;
         VersionEdit wal_deletion;
         bool emit_wal_deletion = false;
-        if (immutable_db_options_.track_and_verify_wals_in_manifest) {
-          // Determining whether DeleteWalsBefore actually shrinks WalSet
-          // membership requires WalSet state outside this site, so emit
-          // unconditionally (pre-existing behavior).
+        if (immutable_db_options_.track_and_verify_wals_in_manifest &&
+            new_min_log > versions_->GetWalSet().GetMinWalNumberToKeep()) {
           wal_deletion.DeleteWalsBefore(new_min_log);
           emit_wal_deletion = true;
         }
@@ -2172,7 +2188,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           false /* is_bottommost */, TableFileCreationReason::kRecovery,
           0 /* oldest_key_time */, 0 /* file_creation_time */, db_id_,
           db_session_id_, 0 /* target_file_size */, meta.fd.GetNumber(),
-          kMaxSequenceNumber);
+          kMaxSequenceNumber, dbname_ /* db_name */);
       Version* version = cfd->current();
       version->Ref();
       TableProperties temp_table_proerties;
@@ -2695,6 +2711,12 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   if (s.ok()) {
     s = impl->CreateArchivalDirectory();
   }
+  if (s.ok() &&
+      impl->immutable_db_options_.use_session_tmp_dir_for_remote_compaction) {
+    // Create the session-scoped temporary directory before a CompactionService
+    // can create any per-job directory under it.
+    s = impl->env_->CreateDirIfMissing(SessionTmpDir(dbname));
+  }
   if (!s.ok()) {
     return s;
   }
@@ -2873,11 +2895,16 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   }
   TEST_SYNC_POINT("DBImpl::Open:Opened");
   Status persist_options_status;
+  bool cleanup_obsolete_options_files = false;
   if (s.ok()) {
     // Persist RocksDB Options before scheduling the compaction.
     // The WriteOptionsFile() will release and lock the mutex internally.
     persist_options_status =
         impl->WriteOptionsFile(write_options, true /*db_mutex_already_held*/);
+    cleanup_obsolete_options_files =
+        impl->immutable_db_options_.avoid_unnecessary_blocking_io &&
+        impl->immutable_db_options_.compaction_service == nullptr &&
+        !impl->disable_delete_obsolete_files_;
     impl->opened_successfully_ = true;
   } else {
     persist_options_status.PermitUncheckedError();
@@ -2902,6 +2929,13 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     // WAL write failures and resultant forced flushes
     sfm->ReserveDiskBuffer(max_write_buffer_size,
                            impl->immutable_db_options_.db_paths[0].path);
+  }
+
+  if (s.ok() &&
+      impl->immutable_db_options_.use_session_tmp_dir_for_remote_compaction) {
+    // Finish deleting data from the previous DB session before this open can
+    // schedule a new compaction in the directory.
+    impl->CleanupSessionTmpDir();
   }
 
   if (s.ok()) {
@@ -2967,6 +3001,17 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     s = impl->RegisterRecordSeqnoTimeWorker();
   }
   impl->options_mutex_.Unlock();
+  if (cleanup_obsolete_options_files) {
+    Status obsolete_options_status =
+        impl->DeleteObsoleteOptionsFiles(/*schedule_only=*/s.ok());
+    if (!obsolete_options_status.ok()) {
+      ROCKS_LOG_WARN(impl->immutable_db_options_.info_log,
+                     "Unable to %s obsolete OPTIONS files%s: %s",
+                     s.ok() ? "schedule deletion of" : "delete",
+                     s.ok() ? "" : " after DB open failure",
+                     obsolete_options_status.ToString().c_str());
+    }
+  }
   if (s.ok()) {
     *dbptr = std::move(impl);
   } else {

@@ -3516,6 +3516,18 @@ class ModelDB : public DB {
     return Status::NotSupported("Not implemented");
   }
 
+  using DB::PrepareFileIngestion;
+  Status PrepareFileIngestion(
+      const std::vector<IngestExternalFileArg>& /*args*/,
+      std::unique_ptr<FileIngestionHandle>* /*handle*/) override {
+    return Status::NotSupported("Not implemented.");
+  }
+
+  Status CommitFileIngestionHandles(
+      std::vector<std::unique_ptr<FileIngestionHandle>> /*handles*/) override {
+    return Status::NotSupported("Not implemented.");
+  }
+
   using DB::CreateColumnFamilyWithImport;
   Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& /*options*/,
@@ -3713,6 +3725,8 @@ class ModelDB : public DB {
   void DisableManualCompaction() override {}
   void AbortAllCompactions() override {}
   void ResumeAllCompactions() override {}
+  void AbortCompactions(ColumnFamilyHandle* /*column_family*/) override {}
+  void ResumeCompactions(ColumnFamilyHandle* /*column_family*/) override {}
 
   Status WaitForCompact(
       const WaitForCompactOptions& /* wait_for_compact_options */) override {
@@ -3773,6 +3787,12 @@ class ModelDB : public DB {
     return Status::OK();
   }
 
+  Status GetPreparedFileInfoForExternalSstIngestion(
+      const std::string& /*file_path*/,
+      std::shared_ptr<const PreparedFileInfo>* /*file_info*/) override {
+    return Status::NotSupported();
+  }
+
   Status GetSortedWalFiles(VectorLogPtr& /*files*/) override {
     return Status::OK();
   }
@@ -3786,11 +3806,10 @@ class ModelDB : public DB {
     return Status::NotSupported();
   }
 
-  Status GetUpdatesSince(
-      ROCKSDB_NAMESPACE::SequenceNumber,
-      std::unique_ptr<ROCKSDB_NAMESPACE::TransactionLogIterator>*,
-      const TransactionLogIterator::ReadOptions& /*read_options*/ =
-          TransactionLogIterator::ReadOptions()) override {
+  Status GetUpdatesSince(ROCKSDB_NAMESPACE::SequenceNumber,
+                         std::unique_ptr<ROCKSDB_NAMESPACE::WalIterator>*,
+                         const WalIterator::ReadOptions& /*read_options*/ =
+                             WalIterator::ReadOptions()) override {
     return Status::NotSupported("Not supported in Model DB");
   }
 
@@ -8070,6 +8089,41 @@ INSTANTIATE_TEST_CASE_P(OpenFilesAsync, OpenFilesAsyncTest,
                         ::testing::Combine(::testing::Values(4),
                                            ::testing::Values(-1, 10),
                                            ::testing::Bool()));
+
+TEST_F(DBTest, ReadOnlyCloseDoesNotDeleteWriterFiles) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("before", "value"));
+  ASSERT_OK(Flush());
+
+  std::unique_ptr<DB> read_only_db;
+  ASSERT_OK(DB::OpenForReadOnly(options, dbname_, &read_only_db));
+
+  ASSERT_OK(Put("after", "value"));
+  ASSERT_OK(Flush());
+
+  std::vector<LiveFileMetaData> live_files;
+  db_->GetLiveFilesMetaData(&live_files);
+  ASSERT_GE(live_files.size(), 2);
+
+  std::string newest_sst_path;
+  uint64_t newest_file_number = 0;
+  for (const auto& live_file : live_files) {
+    if (live_file.file_number > newest_file_number) {
+      newest_file_number = live_file.file_number;
+      newest_sst_path = live_file.directory + "/" + live_file.relative_filename;
+    }
+  }
+  ASSERT_FALSE(newest_sst_path.empty());
+  ASSERT_OK(env_->FileExists(newest_sst_path));
+
+  read_only_db.reset();
+
+  ASSERT_OK(env_->FileExists(newest_sst_path));
+}
 
 // Test mix of races with async file open, reads, compactions
 TEST_P(OpenFilesAsyncTest, ConcurrentFileAccess) {

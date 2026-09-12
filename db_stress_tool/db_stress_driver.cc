@@ -78,11 +78,8 @@ bool RunStressTestImpl(SharedState* shared) {
     if (s.ok() && !ev_dir.empty()) {
       s = InitUnverifiedSubdir(ev_dir);
     }
-    if (!s.ok()) {
-      fprintf(stderr, "%sFailed to setup unverified state dir: %s\n",
-              db_label.c_str(), s.ToString().c_str());
-      exit(1);
-    }
+    DB_STRESS_ASSERT_OK_MSG(s, "%sFailed to setup unverified state dir",
+                            db_label.c_str());
   }
 
   stress->InitDb(shared);
@@ -94,6 +91,13 @@ bool RunStressTestImpl(SharedState* shared) {
           clock->TimeToString(now / 1000000).c_str(), db_label.c_str());
 
   shared->SetThreads(n);
+
+  const bool liveness_watchdog_enabled =
+      FLAGS_liveness_check_interval_sec > 0 &&
+      FLAGS_liveness_no_progress_timeout_sec > 0;
+  if (liveness_watchdog_enabled) {
+    shared->IncBgThreads();
+  }
 
   if (FLAGS_continuous_verification_interval > 0) {
     shared->IncBgThreads();
@@ -129,6 +133,11 @@ bool RunStressTestImpl(SharedState* shared) {
   ThreadState continuous_verification_thread(0, shared);
   if (FLAGS_continuous_verification_interval > 0) {
     raw_env->StartThread(DbVerificationThread, &continuous_verification_thread);
+  }
+
+  ThreadState liveness_watchdog_thread(0, shared);
+  if (liveness_watchdog_enabled) {
+    raw_env->StartThread(LivenessWatchdogThread, &liveness_watchdog_thread);
   }
 
   // Spawn at most one CompressedCacheSetCapacityThread globally. The cache
@@ -177,11 +186,8 @@ bool RunStressTestImpl(SharedState* shared) {
         if (s.ok() && !ev_dir.empty()) {
           s = DestroyUnverifiedSubdir(ev_dir);
         }
-        if (!s.ok()) {
-          fprintf(stderr, "%sFailed to cleanup unverified state dir: %s\n",
-                  db_label.c_str(), s.ToString().c_str());
-          exit(1);
-        }
+        DB_STRESS_ASSERT_OK_MSG(s, "%sFailed to cleanup unverified state dir",
+                                db_label.c_str());
       }
     }
 
@@ -203,7 +209,7 @@ bool RunStressTestImpl(SharedState* shared) {
       }
       if (ShouldDisableAutoCompactionsBeforeVerifyDb()) {
         Status s = stress->EnableAutoCompaction();
-        assert(s.ok());
+        DB_STRESS_ASSERT_OK(s);
       }
       fprintf(stdout, "%s %sStarting database operations\n",
               clock->TimeToString(now / 1000000).c_str(), db_label.c_str());
@@ -268,7 +274,7 @@ bool RunStressTestImpl(SharedState* shared) {
   }
 
   if (FLAGS_compaction_thread_pool_adjust_interval > 0 ||
-      FLAGS_continuous_verification_interval > 0 ||
+      FLAGS_continuous_verification_interval > 0 || liveness_watchdog_enabled ||
       FLAGS_compressed_secondary_cache_size > 0 ||
       FLAGS_compressed_secondary_cache_ratio > 0.0 ||
       remote_compaction_worker_thread_count > 0) {

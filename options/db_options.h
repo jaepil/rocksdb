@@ -36,6 +36,7 @@ struct ImmutableDBOptions {
   std::shared_ptr<Logger> info_log;
   InfoLogLevel info_log_level;
   int max_file_opening_threads;
+  int read_io_executor_threads;
   std::shared_ptr<Statistics> statistics;
   bool use_fsync;
   std::vector<DbPath> db_paths;
@@ -103,6 +104,7 @@ struct ImmutableDBOptions {
   FileTypeSet checksum_handoff_file_types;
   CacheTier lowest_used_cache_tier;
   std::shared_ptr<CompactionService> compaction_service;
+  bool use_session_tmp_dir_for_remote_compaction;
   bool enforce_single_del_contracts;
   uint64_t follower_refresh_catchup_period_ms;
   uint64_t follower_catchup_retry_count;
@@ -155,8 +157,10 @@ struct MutableDBOptions {
   bool verify_manifest_content_on_close;
   bool optimize_manifest_for_recovery;
   bool fast_sst_open;
+  bool remote_compaction_manifest_floor;
   std::string daily_offpeak_time_utc;
   uint64_t max_compaction_trigger_wakeup_seconds;
+  int periodic_compaction_phase_recovery_percent;
 };
 
 Status GetStringFromMutableDBOptions(const ConfigOptions& config_options,

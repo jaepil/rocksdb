@@ -32,6 +32,9 @@
 namespace ROCKSDB_NAMESPACE {
 class BlobFileCache;
 class Version;
+namespace port {
+class RWMutex;
+}
 
 // This file declares the factory functions of DBIter, in its original form
 // or a wrapped form with class ArenaWrappedDBIter, which is defined here.
@@ -83,14 +86,19 @@ class DBIter final : public Iterator {
                          ReadCallback* read_callback,
                          ReadOnlyMemTable* active_mem,
                          ColumnFamilyHandleImpl* cfh = nullptr,
-                         bool expose_blob_index = false,
-                         Arena* arena = nullptr) {
+                         bool expose_blob_index = false, Arena* arena = nullptr,
+                         DBImpl* db_impl = nullptr,
+                         ColumnFamilyData* cfd = nullptr) {
+    if (cfh != nullptr) {
+      db_impl = cfh->db();
+      cfd = cfh->cfd();
+    }
     void* mem = arena ? arena->AllocateAligned(sizeof(DBIter))
                       : operator new(sizeof(DBIter));
     DBIter* db_iter = new (mem)
         DBIter(env, read_options, ioptions, mutable_cf_options,
                user_key_comparator, internal_iter, version, sequence, arena,
-               read_callback, cfh, expose_blob_index, active_mem);
+               read_callback, db_impl, cfd, expose_blob_index, active_mem);
     return db_iter;
   }
 
@@ -207,7 +215,7 @@ class DBIter final : public Iterator {
   }
 
   Status status() const override {
-    if (status_.ok()) {
+    if (status_.ok() && iter_.iter() != nullptr) {
       return iter_.status();
     } else {
       assert(!valid_);
@@ -248,54 +256,42 @@ class DBIter final : public Iterator {
     iter_.SetRangeDelReadSeqno(s);
   }
   void set_valid(bool v) { valid_ = v; }
+  void set_status(Status s) { status_ = std::move(s); }
 
   bool PrepareValue() override;
 
   void Prepare(const MultiScanArgs& scan_opts) override;
   Status ValidateScanOptions(const MultiScanArgs& multiscan_opts) const;
+  Status SetScanOptionsForPrepare(const MultiScanArgs& scan_opts);
+  void PrepareInternalChildren();
 
  private:
   DBIter(Env* _env, const ReadOptions& read_options,
          const ImmutableOptions& ioptions,
          const MutableCFOptions& mutable_cf_options, const Comparator* cmp,
          InternalIterator* iter, const Version* version, SequenceNumber s,
-         bool arena_mode, ReadCallback* read_callback,
-         ColumnFamilyHandleImpl* cfh, bool expose_blob_index,
+         bool arena_mode, ReadCallback* read_callback, DBImpl* db_impl,
+         ColumnFamilyData* cfd, bool expose_blob_index,
          ReadOnlyMemTable* active_mem);
 
   class BlobReader {
    public:
-    BlobReader(const Version* version, ReadTier read_tier,
-               bool verify_checksums, bool fill_cache,
-               Env::IOActivity io_activity, BlobFileCache* blob_file_cache,
-               bool allow_write_path_fallback)
-        : version_(version),
-          read_tier_(read_tier),
-          verify_checksums_(verify_checksums),
-          fill_cache_(fill_cache),
-          io_activity_(io_activity),
-          blob_file_cache_(blob_file_cache),
-          allow_write_path_fallback_(allow_write_path_fallback) {}
+    BlobReader(const Version* version, const ReadOptions& read_options,
+               BlobFileCache* blob_file_cache, bool allow_write_path_fallback)
+        : blob_fetcher_(version, ReadOptions(read_options), blob_file_cache,
+                        allow_write_path_fallback) {}
 
     const Slice& GetBlobValue() const { return blob_value_; }
     Status RetrieveAndSetBlobValue(const Slice& user_key,
-                                   const Slice& blob_index,
-                                   bool allow_write_path_fallback);
+                                   const Slice& blob_index);
     void ResetBlobValue() { blob_value_.Reset(); }
-    // Create a BlobFetcher with the same read options as this BlobReader.
-    BlobFetcher CreateBlobFetcher() const;
+    // The blob fetcher backing this reader, for resolving wide-column entity
+    // blob references (the merge path). Valid for this BlobReader's lifetime.
+    const BlobFetcher& blob_fetcher() const { return blob_fetcher_; }
 
    private:
     PinnableSlice blob_value_;
-    const Version* version_;
-    ReadTier read_tier_;
-    bool verify_checksums_;
-    bool fill_cache_;
-    Env::IOActivity io_activity_;
-    // Cache used by the write-path fallback for in-flight direct-write blob
-    // files that are not yet reachable through Version.
-    BlobFileCache* blob_file_cache_;
-    bool allow_write_path_fallback_;
+    OwningVersionBlobFetcher blob_fetcher_;
   };
   struct BlobState {
     BlobReader reader;
@@ -318,13 +314,10 @@ class DBIter final : public Iterator {
   class ValueColumnsState {
    public:
     ValueColumnsState(const Version* version, const ReadOptions& read_options,
-                      ColumnFamilyHandleImpl* cfh)
+                      ColumnFamilyData* cfd)
         : entity_blob_resolver_(
-              version, read_options.read_tier, read_options.verify_checksums,
-              read_options.fill_cache, read_options.io_activity,
-              cfh ? cfh->cfd()->blob_file_cache() : nullptr,
-              cfh != nullptr &&
-                  cfh->cfd()->blob_partition_manager() != nullptr) {}
+              version, read_options, cfd ? cfd->blob_file_cache() : nullptr,
+              cfd != nullptr && cfd->blob_partition_manager() != nullptr) {}
 
     Slice& value() { return value_; }
     const Slice& value() const { return value_; }
@@ -389,7 +382,7 @@ class DBIter final : public Iterator {
     }
 
     // Clears the previous lazy entity metadata and returns the saved entity
-    // buffer as input for DeserializeV2().
+    // buffer as input for Deserialize().
     Slice PrepareForLazyEntityDeserialize() {
       ClearLazyEntity();
       return Slice(saved_value_);
@@ -663,6 +656,14 @@ class DBIter final : public Iterator {
   UserComparatorWrapper user_comparator_;
   const MergeOperator* const merge_operator_;
   IteratorWrapper iter_;
+  // TODO: blob_state_'s BlobReader (whole-value blob reads + the merge entity
+  // path) and value_columns_state_'s ReadPathBlobResolver (lazy per-column
+  // entity resolution) each own a Version-backed blob fetcher with the same
+  // {version, read_options, blob_file_cache, allow_write_path_fallback}, so an
+  // iterator holds two ReadOptions copies. Collapse to a single shared fetcher.
+  // Deferred because the resolver must keep owning its fetcher for the planned
+  // lazy entity read path, where the result outlives the read call and owns the
+  // SuperVersion pin; unifying is best done together with that work.
   DirtyTracked<BlobState> blob_state_;
   ReadCallback* read_callback_;
   // Max visible sequence number. It is normally the snapshot seq unless we have
@@ -706,7 +707,10 @@ class DBIter final : public Iterator {
   MergeContext merge_context_;
   LocalStatistics local_stats_;
   PinnedIteratorsManager pinned_iters_mgr_;
-  ColumnFamilyHandleImpl* cfh_;
+  DBImpl* trace_db_;
+  uint32_t trace_cf_id_;
+  bool has_trace_state_;
+  port::RWMutex* ingest_sst_lock_;
   const Slice* const timestamp_ub_;
   const Slice* const timestamp_lb_;
   const size_t timestamp_size_;

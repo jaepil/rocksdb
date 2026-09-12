@@ -65,7 +65,9 @@ jobs:
         pip install https://files.pythonhosted.org/packages/fb/ac/3c04772acc0257f5730e83adb542b2603c1a62d1315010ab593a980af404/clang_format-21.1.2-py2.py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
         clang-format --version
     - name: Download clang-format-diff.py
-      run: wget https://rocksdb-deps.s3.us-west-2.amazonaws.com/llvm/llvm-project/release/12.x/clang/tools/clang-format/clang-format-diff.py
+      # Mirrored on the "third-party-deps" GitHub release; add/update via
+      # https://github.com/facebook/rocksdb/releases/edit/third-party-deps
+      run: wget --tries=3 --retry-on-host-error https://github.com/facebook/rocksdb/releases/download/third-party-deps/clang-format-diff.py
     - name: Check format
       run: VERBOSE_CHECK=1 make check-format
     - name: Compare buckify output
@@ -314,6 +316,53 @@ jobs:
     - run: CC=clang-21 CXX=clang++-21 USE_CLANG=1 make -j32 all microbench
     - run: make clean
     - run: CC=clang-21 CXX=clang++-21 USE_CLANG=1 DEBUG_LEVEL=0 make -j32 release
+    - name: Install clang-format-21 for C API gen checks
+      run: apt-get update && apt-get install -y clang-format-21
+    - name: Check C API codegen (link-complete, backward-compatible, up to date)
+      # Run the make target in STRICT mode so this core CI job HARD-FAILS rather
+      # than silently skipping if a prerequisite (clang++, clang-format, or the
+      # compat baseline ref) is ever missing. See `make check-c-api-gen`.
+      env:
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PUSH_BEFORE_SHA: ${{ github.event.before }}
+      run: |
+        # The container checkout is owned by a different user, so git refuses to
+        # operate on it ("dubious ownership") -- mark it safe for the `git fetch`
+        # and the `git show` the compat checker runs.
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        git config --global --add safe.directory '*'
+
+        # A PR must preserve the API of its merge target, while a push must
+        # preserve the API of the branch before the push. Comparing every event
+        # with main produces false removals when a release branch predates APIs
+        # added to main.
+        case "$GITHUB_EVENT_NAME" in
+          pull_request) api_compat_ref="$PR_BASE_SHA" ;;
+          push) api_compat_ref="$PUSH_BEFORE_SHA" ;;
+          *)
+            echo "ERROR: unsupported event for C API compatibility: $GITHUB_EVENT_NAME" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ -z "$api_compat_ref" ]; then
+          echo "ERROR: C API compatibility baseline is empty" >&2
+          exit 1
+        fi
+
+        zero_sha=0000000000000000000000000000000000000000
+        if [ "$api_compat_ref" = "$zero_sha" ]; then
+          # A newly created branch or tag has no prior ref state to preserve.
+          api_compat_ref=HEAD
+        else
+          git fetch --no-tags --depth=1 origin "$api_compat_ref"
+          api_compat_ref=FETCH_HEAD
+        fi
+
+        CXX=clang++-21 make check-c-api-gen \
+          CHECK_C_API_GEN_STRICT=1 \
+          API_COMPAT_REF="$api_compat_ref" \
+          CLANG_FORMAT_BINARY=clang-format-21
     - uses: "./.github/actions/teardown-ccache"
       if: always()
     - uses: "./.github/actions/post-steps"
@@ -377,13 +426,20 @@ jobs:
     steps:
     - uses: actions/checkout@v4.1.0
     - uses: "./.github/actions/pre-steps"
+    - uses: "./.github/actions/cache-getdeps-downloads"
+    - uses: "./.github/actions/setup-folly"
     - uses: "./.github/actions/setup-ccache"
       with:
         cache-key-prefix: mini-crashtest
+    - uses: "./.github/actions/cache-folly"
+      id: cache-folly
+    - uses: "./.github/actions/build-folly"
+      with:
+        cache-hit: ${{ steps.cache-folly.outputs.cache-hit }}
     - run: |
         ulimit -S -n $(ulimit -Hn) # Raise open files soft limit to hard limit
         echo "Updated ulimit -Hn: $(ulimit -Hn) -Sn: $(ulimit -Sn)"
-        make V=1 -j8 CRASH_TEST_EXT_ARGS='--duration=${{ matrix.crash_duration }} --max_key=2500000' ${{ matrix.crash_test_target }}
+        USE_COROUTINES=1 USE_FOLLY=1 LIB_MODE=static make V=1 -j8 CRASH_TEST_EXT_ARGS='--duration=${{ matrix.crash_duration }} --max_key=2500000' ${{ matrix.crash_test_target }}
     - uses: "./.github/actions/teardown-ccache"
       if: always()
     - uses: "./.github/actions/post-steps"
@@ -525,8 +581,8 @@ jobs:
     - uses: "./.github/actions/post-steps"
   # ======================== Windows with Tests ======================= #
   # NOTE: some windows jobs are in "nightly" to save resources
-  build-windows-vs2022:
-    if: needs.config.outputs.only_job == 'build-windows-vs2022' || (needs.config.outputs.only_job == '' && github.repository_owner == 'facebook')
+  build-windows-msvc:
+    if: needs.config.outputs.only_job == 'build-windows-msvc' || (needs.config.outputs.only_job == '' && github.repository_owner == 'facebook')
     needs: config
     runs-on: windows-8-core
     strategy:
@@ -543,7 +599,6 @@ jobs:
           suite_run: ""
           run_java: "true"
     env:
-      CMAKE_GENERATOR: Visual Studio 17 2022
       CMAKE_PORTABLE: 1
     steps:
     - uses: actions/checkout@v4.1.0
@@ -603,7 +658,6 @@ jobs:
     needs: config
     runs-on: macos-15-xlarge
     env:
-      JAVA_HOME: "/Library/Java/JavaVirtualMachines/liberica-jdk-8.jdk/Contents/Home"
       ROCKSDB_DISABLE_JEMALLOC: 1
     steps:
     - uses: actions/checkout@v4.1.0
@@ -615,7 +669,7 @@ jobs:
         cache-key-prefix: macos-java
     - uses: "./.github/actions/increase-max-open-files-on-macos"
     - uses: "./.github/actions/install-gflags-on-macos"
-    - uses: "./.github/actions/install-jdk8-on-macos"
+    - uses: "./.github/actions/setup-jdk-on-macos"
     - uses: "./.github/actions/pre-steps-macos"
     - name: Set Java Environment
       run: |-
@@ -631,8 +685,6 @@ jobs:
     if: needs.config.outputs.only_job == 'build-macos-java-static' || (needs.config.outputs.only_job == '' && github.repository_owner == 'facebook')
     needs: config
     runs-on: macos-15-xlarge
-    env:
-      JAVA_HOME: "/Library/Java/JavaVirtualMachines/liberica-jdk-8.jdk/Contents/Home"
     steps:
     - uses: actions/checkout@v4.1.0
     - uses: maxim-lobanov/setup-xcode@v1.6.0
@@ -643,7 +695,7 @@ jobs:
         cache-key-prefix: macos-java-static
     - uses: "./.github/actions/increase-max-open-files-on-macos"
     - uses: "./.github/actions/install-gflags-on-macos"
-    - uses: "./.github/actions/install-jdk8-on-macos"
+    - uses: "./.github/actions/setup-jdk-on-macos"
     - uses: "./.github/actions/pre-steps-macos"
     - name: Set Java Environment
       run: |-
@@ -659,8 +711,6 @@ jobs:
     if: needs.config.outputs.only_job == 'build-macos-java-static-universal' || (needs.config.outputs.only_job == '' && github.repository_owner == 'facebook')
     needs: config
     runs-on: macos-15-xlarge
-    env:
-      JAVA_HOME: "/Library/Java/JavaVirtualMachines/liberica-jdk-8.jdk/Contents/Home"
     steps:
     - uses: actions/checkout@v4.1.0
     - uses: maxim-lobanov/setup-xcode@v1.6.0
@@ -671,7 +721,7 @@ jobs:
         cache-key-prefix: macos-java-static-universal
     - uses: "./.github/actions/increase-max-open-files-on-macos"
     - uses: "./.github/actions/install-gflags-on-macos"
-    - uses: "./.github/actions/install-jdk8-on-macos"
+    - uses: "./.github/actions/setup-jdk-on-macos"
     - uses: "./.github/actions/pre-steps-macos"
     - name: Set Java Environment
       run: |-

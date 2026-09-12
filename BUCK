@@ -35,6 +35,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/blob/blob_file_partition_manager.cc",
         "db/blob/blob_file_reader.cc",
         "db/blob/blob_garbage_meter.cc",
+        "db/blob/blob_gen2_format.cc",
         "db/blob/blob_log_format.cc",
         "db/blob/blob_log_sequential_reader.cc",
         "db/blob/blob_log_writer.cc",
@@ -58,6 +59,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/compaction/sst_partitioner.cc",
         "db/compaction/subcompaction_state.cc",
         "db/convenience.cc",
+        "db/coro_db.cc",
         "db/db_filesnapshot.cc",
         "db/db_impl/compacted_db_impl.cc",
         "db/db_impl/db_impl.cc",
@@ -94,6 +96,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/merge_operator.cc",
         "db/multi_scan.cc",
         "db/output_validator.cc",
+        "db/periodic_compaction_phaser.cc",
         "db/periodic_task_scheduler.cc",
         "db/range_del_aggregator.cc",
         "db/range_tombstone_fragmenter.cc",
@@ -102,7 +105,6 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/snapshot_impl.cc",
         "db/table_cache.cc",
         "db/table_properties_collector.cc",
-        "db/transaction_log_impl.cc",
         "db/trim_history_scheduler.cc",
         "db/version_builder.cc",
         "db/version_edit.cc",
@@ -110,7 +112,9 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/version_set.cc",
         "db/version_util.cc",
         "db/wal_edit.cc",
+        "db/wal_iterator_impl.cc",
         "db/wal_manager.cc",
+        "db/wide/lazy_wide_columns.cc",
         "db/wide/read_path_blob_resolver.cc",
         "db/wide/wide_column_serialization.cc",
         "db/wide/wide_columns.cc",
@@ -202,6 +206,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "table/block_based/block_cache.cc",
         "table/block_based/block_prefetcher.cc",
         "table/block_based/block_prefix_index.cc",
+        "table/block_based/builtin_index_factory.cc",
         "table/block_based/data_block_footer.cc",
         "table/block_based/data_block_hash_index.cc",
         "table/block_based/filter_block_reader_common.cc",
@@ -267,6 +272,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "util/compression.cc",
         "util/compression_context_cache.cc",
         "util/concurrent_task_limiter_impl.cc",
+        "util/coro_stats_util.cc",
         "util/crc32c.cc",
         "util/crc32c_arm64.cc",
         "util/data_structure.cc",
@@ -305,6 +311,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/compaction_filters.cc",
         "utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc",
         "utilities/convenience/info_log_finder.cc",
+        "utilities/copy_engine/copy_engine.cc",
         "utilities/counted_fs.cc",
         "utilities/debug.cc",
         "utilities/env_mirror.cc",
@@ -378,11 +385,21 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "utilities/write_batch_with_index/write_batch_with_index_internal.cc",
     ], deps=[
         "//folly/container:f14_hash",
+        "//folly/coro:baton",
         "//folly/coro:blocking_wait",
         "//folly/coro:collect",
         "//folly/coro:coroutine",
+        "//folly/coro:nothrow",
         "//folly/coro:task",
+        "//folly/executors/thread_factory:named_thread_factory",
+        "//folly/executors:io_executor",
+        "//folly/executors:io_thread_pool_executor",
+        "//folly/io/async:async_base",
+        "//folly/io/async:event_base_manager",
+        "//folly/io/async:io_uring_backend",
+        "//folly/io/async:request_context",
         "//folly/synchronization:distributed_mutex",
+        "//folly:executor",
     ], headers=glob(["**/*.h"]), link_whole=False, extra_test_libs=False)
 
 cpp_library_wrapper(name="rocksdb_whole_archive_lib", srcs=[], deps=[":rocksdb_lib"], headers=[], link_whole=True, extra_test_libs=False)
@@ -4598,6 +4615,12 @@ cpp_unittest_wrapper(name="bloom_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="builtin_index_factory_test",
+            srcs=["table/block_based/builtin_index_factory_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="cache_reservation_manager_test",
             srcs=["cache/cache_reservation_manager_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -4738,6 +4761,12 @@ cpp_unittest_wrapper(name="compression_test",
 
 cpp_unittest_wrapper(name="configurable_test",
             srcs=["options/configurable_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="copy_engine_test",
+            srcs=["utilities/copy_engine/copy_engine_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
@@ -4924,6 +4953,12 @@ cpp_unittest_wrapper(name="db_iterator_test",
 
 cpp_unittest_wrapper(name="db_kv_checksum_test",
             srcs=["db/db_kv_checksum_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="db_lazy_entity_test",
+            srcs=["db/wide/db_lazy_entity_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 
@@ -5795,3 +5830,5 @@ cpp_unittest_wrapper(name="write_unprepared_transaction_test",
 
 
 export_file(name = "tools/db_crashtest.py")
+
+export_file(name = "tools/fault_injection_log_parser.py")
